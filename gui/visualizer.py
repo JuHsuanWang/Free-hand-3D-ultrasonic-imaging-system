@@ -581,8 +581,8 @@ class VisualizerController:
 
         return band
 
-    def otsu_segmentation(self, image: np.ndarray, threshold: int) -> np.ndarray:
-        """Detect dark regions using fixed threshold and contour area filtering."""
+    def otsu_segmentation(self, image: np.ndarray, low: int, high: int) -> np.ndarray:
+        """Detect regions within [low, high] using range threshold and contour area filtering."""
         if image.ndim == 3:
             if image.shape[2] == 4:
                 gray = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
@@ -592,7 +592,7 @@ class VisualizerController:
             gray = image.copy()
 
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        _, binary = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY_INV)
+        binary = cv2.inRange(blurred, int(low), int(high))  # keep pixels in [low, high]
 
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
@@ -624,7 +624,7 @@ class VisualizerController:
 
         def _seg_one(i: int):
             try:
-                pts = self.otsu_segmentation(self.sess.right_frames[i], self.cfg.dark_threshold)
+                pts = self.otsu_segmentation(self.sess.right_frames[i], self.cfg.bright_low, self.cfg.bright_high)
                 return i, pts
             except Exception:
                 return i, np.empty((0, 2), dtype=np.float32)
@@ -634,7 +634,10 @@ class VisualizerController:
                 self.sess.contour_points_list[i] = pts
 
         total_points = sum(len(p) for p in self.sess.contour_points_list if p is not None)
-        print(f"  Segmentation complete (threshold={self.cfg.dark_threshold}): {total_points} total contour points")
+        print(
+            f"  Segmentation complete (bright_range=[{self.cfg.bright_low},{self.cfg.bright_high}]): "
+            f"{total_points} total contour points"
+        )
 
     def run_processing(self):
         """Full pipeline after selection: stabilization -> crop -> segmentation -> optional save."""

@@ -16,11 +16,13 @@ class AppConfig:
 
     # Crop settings
     crop_size: int = 100
-    y_spacing: float = 6.0
+    y_spacing: float = 5.3
 
     # Segmentation settings
-    dark_threshold: int = 20
+    bright_low: int = 140     # keep pixels >= bright_low
+    bright_high: int = 220    # keep pixels <= bright_high
     min_contour_area: int = 500
+
 
     # Performance
     num_workers: int = multiprocessing.cpu_count()
@@ -53,3 +55,5 @@ class AppConfig:
     max_points: int = 12000
     surface_alpha: float = 25.0
     surface_opacity: float = 0.35
+
+
