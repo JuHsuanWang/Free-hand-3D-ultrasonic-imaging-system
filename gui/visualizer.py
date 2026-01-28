@@ -15,9 +15,12 @@ from algorithms.geometry import (
 from core.session import SessionState
 from config import AppConfig
 from algorithms.stabilizer import StabilizerConfig, SequenceStabilizer, to_gray_u8
-from algorithms.out_of_plane import OutOfPlaneConfig, compute_lr_heatmap_like_matlab
-
-
+from algorithms.out_of_plane import (
+    OutOfPlaneConfig,
+    compute_lr_heatmap_like_matlab,
+    OutOfPlaneRotConfig,
+    compute_beta_gamma_from_right_grid,
+)
 
 class VisualizerController:
     """
@@ -53,6 +56,7 @@ class VisualizerController:
 
         # injected by MainWindow: QLabel on top of QtInteractor
         self.heatmap_overlay_label = None
+        self._plane_records = []  # store meshes + base points for out-of-plane update
 
 
     # -------------------------
@@ -85,10 +89,120 @@ class VisualizerController:
                 pass
 
     def toggle_frames(self):
+        prev = bool(self.sess.frames_visible)
         self.sess.frames_visible = not self.sess.frames_visible
+
         for a in self.frame_actors:
             self._set_actor_visibility(a, self.sess.frames_visible)
+
+        if (not prev) and self.sess.frames_visible:
+            self._apply_out_of_plane_to_planes()
+
+            # extra safety: force actors to refresh
+            for a in self.frame_actors:
+                try:
+                    a.GetMapper().Update()
+                except Exception:
+                    pass
+            self.plotter.render()
+        else:
+            self.plotter.render()
+
+
+    def _rotate_points_beta_gamma(self, pts: np.ndarray, center: np.ndarray, beta_deg: float, gamma_deg: float) -> np.ndarray:
+        """
+        Rotate 3D points around:
+        - gamma: rotation about Z axis (x-y plane)
+        - beta : rotation about X axis (y-z plane)
+        Applied around 'center'.
+        """
+        if pts is None:
+            return pts
+        if (beta_deg is None) or (gamma_deg is None) or (not np.isfinite(beta_deg)) or (not np.isfinite(gamma_deg)):
+            return pts
+
+        b = np.deg2rad(float(beta_deg))
+        g = np.deg2rad(float(gamma_deg))
+
+        # translate to origin
+        P = pts.astype(np.float64) - center[None, :]
+
+        # Rz(gamma)
+        cg, sg = np.cos(g), np.sin(g)
+        Rz = np.array([[cg, -sg, 0.0],
+                    [sg,  cg, 0.0],
+                    [0.0, 0.0, 1.0]], dtype=np.float64)
+
+        # Rx(beta)
+        cb, sb = np.cos(b), np.sin(b)
+        Rx = np.array([[1.0, 0.0, 0.0],
+                    [0.0,  cb, -sb],
+                    [0.0,  sb,  cb]], dtype=np.float64)
+
+        # apply rotation (order: Rz then Rx)
+        P = (Rx @ (Rz @ P.T)).T
+
+        # back
+        return (P + center[None, :]).astype(np.float32)
+
+    def _apply_out_of_plane_to_planes(self):
+        """
+        Update already-rendered plane meshes using sess.beta_deg / sess.gamma_deg
+        and force VTK to refresh.
+        """
+        s = self.sess
+        if not hasattr(s, "beta_deg") or not hasattr(s, "gamma_deg"):
+            print("[OOP] no beta/gamma fields")
+            return
+        if s.beta_deg is None or s.gamma_deg is None:
+            print("[OOP] beta/gamma is None")
+            return
+        if len(self._plane_records) == 0:
+            print("[OOP] no plane records")
+            return
+
+        updated = 0
+
+        def _update_mesh_points_inplace(mesh: pv.PolyData, new_pts: np.ndarray):
+            # IMPORTANT: in-place update to keep VTK pipeline happy
+            mesh.points[:] = new_pts
+            try:
+                mesh.GetPoints().Modified()
+            except Exception:
+                pass
+            try:
+                mesh.Modified()
+            except Exception:
+                pass
+
+        for rec in self._plane_records:
+            i = rec["frame_idx"]
+            if i >= len(s.beta_deg) or i >= len(s.gamma_deg):
+                continue
+
+            beta = float(s.beta_deg[i])
+            gamma = float(s.gamma_deg[i])
+            center = rec["center"]
+
+            full_new = self._rotate_points_beta_gamma(rec["full_pts0"], center, beta, gamma)
+            crop_new = self._rotate_points_beta_gamma(rec["crop_pts0"], center, beta, gamma)
+            cb_new   = self._rotate_points_beta_gamma(rec["crop_border_pts0"], center, beta, gamma)
+            bb_new   = self._rotate_points_beta_gamma(rec["band_border_pts0"], center, beta, gamma)
+
+            _update_mesh_points_inplace(rec["full_mesh"], full_new)
+            _update_mesh_points_inplace(rec["crop_mesh"], crop_new)
+            _update_mesh_points_inplace(rec["crop_border_mesh"], cb_new)
+            _update_mesh_points_inplace(rec["band_border_mesh"], bb_new)
+            if "grid9_mesh" in rec and "grid9_pts0" in rec:
+                g9_new = self._rotate_points_beta_gamma(rec["grid9_pts0"], center, beta, gamma)
+                _update_mesh_points_inplace(rec["grid9_mesh"], g9_new)
+
+
+            updated += 1
+
+        print(f"[OOP] updated {updated} planes using beta/gamma")
         self.plotter.render()
+
 
     def toggle_point_cloud(self):
         self.sess.point_cloud_visible = not self.sess.point_cloud_visible
@@ -107,7 +221,6 @@ class VisualizerController:
         for a in self.band_border_actors:
             self._set_actor_visibility(a, self.sess.band_box_visible)
         self.plotter.render()
-
 
     # -------------------------
     # Coordinate conversion
@@ -474,6 +587,10 @@ class VisualizerController:
             line_width=3,
             render_lines_as_tubes=True
         )
+        # apply visibility toggle
+        if hasattr(self.sess, "grid9_visible"):
+            self._set_actor_visibility(self.grid9_actor, self.sess.grid9_visible)
+
         # -------------------------------------------------------------
         # ---- Yellow band = middle row (4-5-6) of 3x3 grid ----
         cell = int(self.cfg.crop_size)
@@ -563,7 +680,7 @@ class VisualizerController:
         if len(frames) == 0:
             return np.array([])
 
-        band_h = 50  # use 50 as band height
+        band_h = int(self.cfg.crop_size)  # keep consistent with yellow-band height
         half = band_h // 2
 
         n, h, w, c = frames.shape
@@ -678,9 +795,33 @@ class VisualizerController:
                 # ----------------------------------------------
             )
             stabilizer = SequenceStabilizer(stab_cfg)
-            self.sess.right_frames, self.sess.left_frames = stabilizer.stabilize_full_roi_inplace(
+            self.sess.right_frames, self.sess.left_frames, transforms = stabilizer.stabilize_full_roi_inplace(
                 self.sess.right_frames, self.sess.left_frames, self.sess.click_point
             )
+            self.sess.stabilize_transforms = transforms
+
+        # --- NEW: build freehand per-frame motion arrays (i -> i+1) ---
+        n_frames = len(self.sess.right_frames)
+        dx_mm = np.zeros((max(0, n_frames - 1),), dtype=np.float64)
+        dz_mm = np.zeros((max(0, n_frames - 1),), dtype=np.float64)
+        dalpha_deg = np.zeros((max(0, n_frames - 1),), dtype=np.float64)
+
+        # transforms contains entries for i=1..n-1, each is ref(i-1)->mov(i) forward estimate
+        # tx_px,tz_px are in pixels; convert to mm using cfg.dx_mm/cfg.dz_mm
+        # theta_rad -> deg
+        for rec in transforms:
+            i = int(rec["i"])
+            if i <= 0 or i >= n_frames:
+                continue
+            dx_mm[i - 1] = float(rec["tx_px"]) * float(self.cfg.dx_mm)
+            dz_mm[i - 1] = float(rec["tz_px"]) * float(self.cfg.dz_mm)
+            dalpha_deg[i - 1] = float(rec["theta_rad"]) * 180.0 / np.pi
+
+        self.sess.fh_dx_mm = dx_mm
+        self.sess.fh_dz_mm = dz_mm
+        self.sess.fh_dalpha_deg = dalpha_deg
+        self.sess.fh_dy_mm = np.full_like(dx_mm, float(self.cfg.fh_dy_mm_per_frame), dtype=np.float64)
+        # ------------------------------------------------------------
 
         # Refresh 100x100 crops based on possibly stabilized frames
         self.sess.cropped_left = self.crop_frames_vectorized(self.sess.left_frames[:n], self.sess.click_point)
@@ -713,6 +854,37 @@ class VisualizerController:
             print(f"  Saved crops to {out_dir}")
 
         self.update_status("Processing done.")
+        # --- NEW: GT plot (optional) ---
+        if bool(self.cfg.enable_gt_plot):
+            try:
+                from analysis.gt_plot import load_em_perframe_motion, plot_gt_summary
+
+                # load EM per-frame motion
+                em = load_em_perframe_motion(
+                    tracker_csv_path=self.cfg.tracker_csv_path,
+                    port=self.cfg.tracker_port,
+                    axis_map={"x": "Tx", "y": "Ty", "z": "Tz"},  # 若你之後要換軸，在這裡改
+                )
+
+                out_png = os.path.join(os.path.dirname(self.cfg.png_out_dir.rstrip("/\\")), self.cfg.gt_plot_filename)
+
+                plot_gt_summary(
+                    out_png_path=out_png,
+                    fh_dx_mm=np.asarray(self.sess.fh_dx_mm, dtype=np.float64),
+                    fh_dy_mm=np.asarray(self.sess.fh_dy_mm, dtype=np.float64),
+                    fh_dz_mm=np.asarray(self.sess.fh_dz_mm, dtype=np.float64),
+                    fh_dalpha_deg=np.asarray(self.sess.fh_dalpha_deg, dtype=np.float64),
+                    em_dx_mm=np.asarray(em["em_dx_mm"], dtype=np.float64),
+                    em_dy_mm=np.asarray(em["em_dy_mm"], dtype=np.float64),
+                    em_dz_mm=np.asarray(em["em_dz_mm"], dtype=np.float64),
+                    em_dalpha_deg=np.asarray(em["em_dalpha_deg"], dtype=np.float64),
+                )
+
+                print(f"[GT] Saved comparison plot: {out_png}")
+            except Exception as e:
+                print(f"[GT] Plot failed: {e}")
+        # -------------------------------
+
         self.plotter.render()
 
     def compute_y_heatmap_like_matlab(self):
@@ -908,6 +1080,148 @@ class VisualizerController:
 
         self.show_out_of_plane_heatmap_overlay()
 
+    def compute_beta_gamma_out_of_plane(self):
+        """
+        Compute per-frame beta/gamma (deg) using R-plane 3x3 grid patches (exclude center),
+        comparing each frame with its next 5 frames (median aggregation).
+        """
+        if self.sess.right_frames is None or self.sess.click_point is None:
+            self.sess.beta_deg = None
+            self.sess.gamma_deg = None
+            return
+
+        rot_cfg = OutOfPlaneRotConfig(
+            normalize_brightness=False,
+            normalize_contrast=False,
+            grid_spacing=10,
+            window_size=25,
+            max_displacement=150.0,
+            det_thresh=1e-6,
+            lookahead=10,
+            time_median_win=5,
+            cell_size=int(self.cfg.crop_size),   # 100
+            exclude_center=True,
+            min_patches_for_fit=4,
+        )
+
+        beta, gamma = compute_beta_gamma_from_right_grid(
+            self.sess.right_frames,
+            click_point_xy=self.sess.click_point,
+            cfg=rot_cfg,
+        )
+        self.sess.beta_deg = beta
+        self.sess.gamma_deg = gamma
+
+    def show_beta_gamma_overlay(self):
+        """
+        Render beta/gamma plot to PNG and show it in the overlay QLabel.
+        Click overlay to hide.
+        """
+        if self.heatmap_overlay_label is None:
+            print("[BetaGamma] overlay label not set")
+            return
+        if self.sess.beta_deg is None or self.sess.gamma_deg is None:
+            return
+        if self.sess.beta_deg.size == 0:
+            return
+
+        from PyQt5 import QtGui, QtCore
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from io import BytesIO
+        import os
+
+        beta = self.sess.beta_deg
+        gamma = self.sess.gamma_deg
+        n = int(beta.size)
+        x = np.arange(n, dtype=np.int32)
+
+        fig = plt.figure(figsize=(7.6, 5.6), dpi=150)
+
+        ax1 = fig.add_subplot(211)
+        ax2 = fig.add_subplot(212, sharex=ax1)
+
+        ax1.plot(x, beta, linewidth=1.4)
+        ax1.set_ylabel("beta (deg)")
+        ax1.set_title("Out-of-plane Rotation (R 3x3 Grid, exclude center, lookahead=10)")
+        ax1.grid(True, alpha=0.25)
+
+        ax2.plot(x, gamma, linewidth=1.4)
+        ax2.set_xlabel("Frame #")
+        ax2.set_ylabel("gamma (deg)")
+        ax2.grid(True, alpha=0.25)
+
+        fig.tight_layout()
+
+        buf = BytesIO()
+        fig.savefig(buf, format="png")
+        plt.close(fig)
+        buf.seek(0)
+
+        pix = QtGui.QPixmap()
+        pix.loadFromData(buf.getvalue(), "PNG")
+
+        parent = self.heatmap_overlay_label.parentWidget() or self.heatmap_overlay_label
+        max_w = int(parent.width() * 0.80)
+        max_h = int(parent.height() * 0.80)
+        pix = pix.scaled(max_w, max_h, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+
+        self.heatmap_overlay_label.setPixmap(pix)
+        self.heatmap_overlay_label.setFixedSize(pix.size())
+        self.heatmap_overlay_label.setVisible(True)
+        self.heatmap_overlay_label.raise_()
+
+        if not hasattr(self.heatmap_overlay_label, "_hide_installed_beta_gamma"):
+            self.heatmap_overlay_label._hide_installed_beta_gamma = True
+
+            def _mousePressEvent(evt):
+                self.heatmap_overlay_label.setVisible(False)
+
+            # keep same click-to-hide UX
+            self.heatmap_overlay_label.mousePressEvent = _mousePressEvent
+
+        # Save PNG to output/<run_name>/... (same folder logic as your GT plot)
+        try:
+            base_dir = os.path.dirname(self.cfg.png_out_dir.rstrip("/\\"))
+            out_png = os.path.join(base_dir, "beta_gamma.png")
+            # Re-render quickly to file using the same buffers is annoying; just save from pixmap bytes:
+            with open(out_png, "wb") as f:
+                f.write(buf.getvalue())
+            print(f"[BetaGamma] Saved: {out_png}")
+        except Exception as e:
+            print(f"[BetaGamma] Save failed: {e}")
+
+    def on_show_beta_gamma(self):
+        if not self.sess.selection_confirmed:
+            return
+
+        # toggle behavior
+        if self.heatmap_overlay_label.isVisible():
+            self.heatmap_overlay_label.setVisible(False)
+            return
+
+        if self.sess.beta_deg is None or self.sess.gamma_deg is None:
+            self.update_status("Computing out-of-plane rotation (beta/gamma)...")
+            self.plotter.render()
+            self.compute_beta_gamma_out_of_plane()
+            self.update_status("Ready.")
+            self.plotter.render()
+
+        self.show_beta_gamma_overlay()
+
+    def toggle_grid9_box(self, visible: bool):
+        self.sess.grid9_visible = bool(visible)
+
+        # Step2 (selection scene)
+        self._set_actor_visibility(self.grid9_actor, self.sess.grid9_visible)
+
+        # 3D view (stacked planes)
+        for a in getattr(self, "grid9_border_actors", []):
+            self._set_actor_visibility(a, self.sess.grid9_visible)
+
+        self.plotter.render()
+
     # -------------------------
     # 3D Visualization
     # -------------------------
@@ -959,6 +1273,7 @@ class VisualizerController:
 
         all_meshes = []
         all_contour_points = []
+        self._plane_records = []
 
         # Render every 5 frames (same as your original)
         for i in range(0, n, 5):
@@ -1033,19 +1348,97 @@ class VisualizerController:
                 [crop_x_left, y_pos, crop_z_top],
             ], dtype=np.float32)
             border_mesh = pv.lines_from_points(border_pts)
+            # ---- orange 3x3 grid (same y_pos) ----
+            cell = int(self.cfg.crop_size)  # 100
+            offsets = [-1.5 * cell, -0.5 * cell, 0.5 * cell, 1.5 * cell]
+
+            grid_lines = []
+
+            # vertical lines (x fixed, z spans full grid height)
+            for dx in offsets:
+                x = crop_world_x + dx
+                z1 = crop_world_z + offsets[0]
+                z2 = crop_world_z + offsets[-1]
+                grid_lines.append(pv.Line((x, y_pos, z1), (x, y_pos, z2)))
+
+            # horizontal lines (z fixed, x spans full grid width)
+            for dz in offsets:
+                z = crop_world_z + dz
+                x1 = crop_world_x + offsets[0]
+                x2 = crop_world_x + offsets[-1]
+                grid_lines.append(pv.Line((x1, y_pos, z), (x2, y_pos, z)))
+
+            grid9_mesh = grid_lines[0]
+            for ln in grid_lines[1:]:
+                grid9_mesh = grid9_mesh.merge(ln)
+
+            # keep a copy of unrotated points for later updates
+            grid9_pts0 = np.asarray(grid9_mesh.points, dtype=np.float32).copy()
+            # ---------------------------------------
+
+
+            # plane pivot center (rotate around plane center)
+            center = np.array([s.frame_w * 0.5, y_pos, s.frame_h * 0.5], dtype=np.float32)
+
+            # If beta/gamma already exists, build with rotation right away
+            beta0 = s.beta_deg[i] if (hasattr(s, "beta_deg") and s.beta_deg is not None and i < len(s.beta_deg)) else None
+            gamma0 = s.gamma_deg[i] if (hasattr(s, "gamma_deg") and s.gamma_deg is not None and i < len(s.gamma_deg)) else None
+
+            full_pts_rot = self._rotate_points_beta_gamma(full_pts, center, beta0, gamma0)
+            crop_pts_rot = self._rotate_points_beta_gamma(crop_pts, center, beta0, gamma0)
+            border_pts_rot = self._rotate_points_beta_gamma(border_pts, center, beta0, gamma0)
+            band_border_pts_rot = self._rotate_points_beta_gamma(band_border_pts, center, beta0, gamma0)
+            grid9_pts_rot = self._rotate_points_beta_gamma(grid9_pts0, center, beta0, gamma0)
+
+
+            # overwrite the points used to create meshes
+            full_mesh.points = full_pts_rot
+            crop_mesh.points = crop_pts_rot
+            border_mesh.points = border_pts_rot
+            band_border_mesh.points = band_border_pts_rot
+            grid9_mesh.points = grid9_pts_rot
 
             all_meshes.append({
                 "full": (full_mesh, full_tex),
                 "crop": (crop_mesh, crop_tex),
                 "crop_border": border_mesh,
-                "band_border": band_border_mesh
+                "band_border": band_border_mesh,
+                "grid9_border": grid9_mesh,
+            })
+
+
+            self._plane_records.append({
+                "frame_idx": i,
+                "center": center,
+                "full_mesh": full_mesh,
+                "crop_mesh": crop_mesh,
+                "crop_border_mesh": border_mesh,
+                "band_border_mesh": band_border_mesh,
+                "full_pts0": full_pts.copy(),
+                "crop_pts0": crop_pts.copy(),
+                "crop_border_pts0": border_pts.copy(),
+                "band_border_pts0": band_border_pts.copy(),
+                "grid9_mesh": grid9_mesh,
+                "grid9_pts0": grid9_pts0.copy(),
+
             })
 
             contour_pts_2d = s.contour_points_list[i]
             if contour_pts_2d is not None and len(contour_pts_2d) > 0:
-                for pt in contour_pts_2d:
+                pts2d = np.asarray(contour_pts_2d, dtype=np.float32)
+
+                # ---remove points in the top X% of cyan ROI ---
+                if bool(self.cfg.enable_crop_top):
+                    y_cut = float(self.cfg.crop_top_frac) * float(s.frame_h)  # s.frame_h is ROI height
+                    pts2d = pts2d[pts2d[:, 1] >= y_cut]
+                    if pts2d.shape[0] == 0:
+                        continue
+                # -----------------------------------------------
+
+                for pt in pts2d:
                     wx, wy, wz = full_img_to_world_3d(int(pt[0]), int(pt[1]), i, s.frame_h, self.cfg.y_spacing)
                     all_contour_points.append([wx, wy, wz])
+
 
         self.update_status(f"Rendering {n} frames...")
         self.plotter.render()
@@ -1054,6 +1447,7 @@ class VisualizerController:
         self.frame_actors = []
         self.crop_border_actors = []
         self.band_border_actors = []
+        self.grid9_border_actors = []
         for data in all_meshes:
             a_full = self.plotter.add_mesh(data["full"][0], texture=data["full"][1], opacity=0.15)
             a_crop = self.plotter.add_mesh(data["crop"][0], texture=data["crop"][1], opacity=0.95)
@@ -1073,6 +1467,15 @@ class VisualizerController:
                 color="yellow",
                 line_width=2
             )
+            # orange 3x3 grid
+            a_grid9 = self.plotter.add_mesh(
+                data["grid9_border"],
+                color="orange",
+                line_width=2
+            )
+            self._set_actor_visibility(a_grid9, getattr(self.sess, "grid9_visible", True))
+            self.grid9_border_actors.append(a_grid9)
+
             self._set_actor_visibility(a_band_border, self.sess.band_box_visible)
             self.band_border_actors.append(a_band_border)
 

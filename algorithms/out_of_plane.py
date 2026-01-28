@@ -239,17 +239,19 @@ def compute_lr_heatmap_like_matlab(
         g = _to_gray_u8(cropped_right[j])
         right_norm.append(normalize_image_like_matlab(g, cfg))
 
-    # --- NEW: precompute gradients for each left frame once (major speedup) ---
+    # --- Precompute gradients for each left frame once (major speedup) ---
     left_grads = []
     for i in range(nL):
         Iy, Ix = np.gradient(left_norm[i])  # note: np.gradient returns (dy, dx)
         left_grads.append((Ix, Iy))
 
-
+    max_r_ahead = 50
     for l in range(nL):
         ref = left_norm[l]
+        r_start = l + 1
+        r_end = min(l + 1 + max_r_ahead, nR)  # Python range end is exclusive
         # MATLAB: r starts from l+1 (L0->R1.., L1->R2..)
-        for r in range(l + 1, nR):
+        for r in range(r_start, r_end):
             cur = right_norm[r]
             Ix, Iy = left_grads[l]
             _, valid_mask, disp_mag, _ = calculate_optical_flow_similarity_like_matlab_boxfilter_pregrad(
@@ -272,3 +274,296 @@ def compute_lr_heatmap_like_matlab(
         best.append((l, r_idx, float(H[l, r_idx])))
 
     return H, best
+
+# ============================================================
+# Out-of-plane rotation (beta/gamma) from 3x3 grid (exclude center)
+# ============================================================
+
+@dataclass
+class OutOfPlaneRotConfig:
+    # LK params (reuse the same LK core)
+    normalize_brightness: bool = False
+    normalize_contrast: bool = False
+    target_mean: float = 128.0
+    target_std: float = 50.0
+
+    grid_spacing: int = 10
+    window_size: int = 25
+    max_displacement: float = 150.0
+    det_thresh: float = 1e-6
+
+    # motion aggregation
+    lookahead: int = 5                 # compare frame i with i+1..i+lookahead
+    time_median_win: int = 5           # temporal median filter window (odd suggested)
+
+    # 3x3 cell geometry (in ROI pixel coordinates)
+    cell_size: int = 100               # each cell is 100x100 in your UI
+    exclude_center: bool = True        # use 1,2,3,4,6,7,8,9
+
+    # minimum patches required to fit deformation
+    min_patches_for_fit: int = 4
+
+
+def _median_filter_1d_nan(x: np.ndarray, win: int) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    n = x.size
+    if n == 0 or win <= 1:
+        return x.copy()
+    if win % 2 == 0:
+        win += 1
+    r = win // 2
+    y = np.full_like(x, np.nan, dtype=np.float64)
+    for i in range(n):
+        a = max(0, i - r)
+        b = min(n, i + r + 1)
+        w = x[a:b]
+        w = w[np.isfinite(w)]
+        if w.size > 0:
+            y[i] = float(np.median(w))
+    return y
+
+
+def _interp_extrap_1d_nan(x: np.ndarray) -> np.ndarray:
+    """
+    Linear interpolation for NaNs inside range + linear extrapolation at both ends.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    n = x.size
+    if n == 0:
+        return x
+    idx = np.arange(n, dtype=np.float64)
+    m = np.isfinite(x)
+    if np.all(m):
+        return x.copy()
+    if np.sum(m) == 0:
+        return np.zeros_like(x, dtype=np.float64)
+
+    y = x.copy()
+
+    # interp inside
+    y[~m] = np.interp(idx[~m], idx[m], x[m])
+
+    # extrap left using first two finite points
+    finite_idx = idx[m]
+    finite_val = x[m]
+    if finite_idx.size >= 2:
+        i0, i1 = finite_idx[0], finite_idx[1]
+        v0, v1 = finite_val[0], finite_val[1]
+        slope = (v1 - v0) / (i1 - i0 + 1e-12)
+        left = np.where(idx < i0)[0]
+        y[left] = v0 + slope * (idx[left] - i0)
+
+        # extrap right using last two finite points
+        j0, j1 = finite_idx[-2], finite_idx[-1]
+        u0, u1 = finite_val[-2], finite_val[-1]
+        slope_r = (u1 - u0) / (j1 - j0 + 1e-12)
+        right = np.where(idx > j1)[0]
+        y[right] = u1 + slope_r * (idx[right] - j1)
+
+    else:
+        # only one finite point -> fill all with it
+        y[:] = finite_val[0]
+
+    return y
+
+
+def _to_gray_float64(img: np.ndarray, cfg: OutOfPlaneRotConfig) -> np.ndarray:
+    g_u8 = _to_gray_u8(img)
+    if cfg.normalize_brightness or cfg.normalize_contrast:
+        return normalize_image_like_matlab(g_u8, OutOfPlaneConfig(
+            normalize_brightness=cfg.normalize_brightness,
+            normalize_contrast=cfg.normalize_contrast,
+            target_mean=cfg.target_mean,
+            target_std=cfg.target_std,
+            grid_spacing=cfg.grid_spacing,
+            window_size=cfg.window_size,
+            max_displacement=cfg.max_displacement,
+            det_thresh=cfg.det_thresh,
+        ))
+    return g_u8.astype(np.float64)
+
+
+def _extract_patch(gray: np.ndarray, cx: int, cy: int, cell: int) -> Optional[np.ndarray]:
+    half = cell // 2
+    y1, y2 = cy - half, cy + half
+    x1, x2 = cx - half, cx + half
+    h, w = gray.shape[:2]
+    if x1 < 0 or y1 < 0 or x2 >= w or y2 >= h:
+        return None
+    return gray[y1:y2, x1:x2]
+
+
+def _patch_flow_median(
+    img1_gray: np.ndarray,
+    img2_gray: np.ndarray,
+    cfg: OutOfPlaneRotConfig
+) -> Tuple[float, float, float]:
+    """
+    Return (vx_med, vy_med, valid_ratio).
+    """
+    h, w = img1_gray.shape
+    xs = np.arange(cfg.grid_spacing, w - cfg.grid_spacing + 1, cfg.grid_spacing)
+    ys = np.arange(cfg.grid_spacing, h - cfg.grid_spacing + 1, cfg.grid_spacing)
+    if xs.size == 0 or ys.size == 0:
+        return np.nan, np.nan, 0.0
+
+    Xg, Yg = np.meshgrid(xs, ys)
+    pts = np.column_stack([Xg.reshape(-1), Yg.reshape(-1)]).astype(np.int32)
+
+    Iy, Ix = np.gradient(img1_gray)  # (dy, dx)
+    of_cfg = OutOfPlaneConfig(
+        normalize_brightness=False,
+        normalize_contrast=False,
+        target_mean=cfg.target_mean,
+        target_std=cfg.target_std,
+        grid_spacing=cfg.grid_spacing,
+        window_size=cfg.window_size,
+        max_displacement=cfg.max_displacement,
+        det_thresh=cfg.det_thresh,
+    )
+
+    flow, valid_mask, _, _ = calculate_optical_flow_similarity_like_matlab_boxfilter_pregrad(
+        img1_gray, img2_gray, Ix, Iy, pts, of_cfg
+    )
+    if not np.any(valid_mask):
+        return np.nan, np.nan, 0.0
+
+    v = flow[valid_mask]
+    vx = float(np.median(v[:, 0]))
+    vy = float(np.median(v[:, 1]))
+    return vx, vy, float(np.mean(valid_mask))
+
+
+def _fit_affine_from_patch_flows(pos: np.ndarray, d: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Fit d = A @ pos + t , where pos=(N,2), d=(N,2).
+    Return A (2,2). t is ignored for beta/gamma extraction.
+    """
+    if pos.shape[0] < 3:
+        return None
+    # design matrix for [x z 1]
+    X = np.column_stack([pos[:, 0], pos[:, 1], np.ones((pos.shape[0],), dtype=np.float64)])  # (N,3)
+    # solve for dx, dz separately
+    try:
+        px, *_ = np.linalg.lstsq(X, d[:, 0], rcond=None)  # (3,)
+        py, *_ = np.linalg.lstsq(X, d[:, 1], rcond=None)  # (3,)
+    except Exception:
+        return None
+
+    # A = [[px0, px1],
+    #      [py0, py1]]
+    A = np.array([[px[0], px[1]],
+                  [py[0], py[1]]], dtype=np.float64)
+    return A
+
+
+def compute_beta_gamma_from_right_grid(
+    right_frames: np.ndarray,
+    click_point_xy: Tuple[int, int],
+    cfg: Optional[OutOfPlaneRotConfig] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Use R-plane 3x3 grid (exclude center) patches:
+      cells 1,2,3,4,6,7,8,9
+    For each frame i:
+      compare i vs i+1..i+lookahead
+      each comparison:
+        - compute LK flow in each patch (median of valid flows)
+        - fit an affine deformation model: d = A*[x,z] + t (pos relative to center)
+        - extract beta/gamma as shear proxies:
+            beta  = atan(A[1,0])  (vertical displacement depends on x)
+            gamma = atan(A[0,1])  (horizontal displacement depends on z)
+      aggregate across lookahead with median
+    Then temporal median filter + interp/extrap to fill NaNs.
+
+    NOTE:
+    - This gives a stable "rotation proxy" series aligned with your MATLAB-style pipeline.
+    - Absolute physical calibration (deg/mm) is not applied here; angles are derived from deformation slopes.
+    """
+    if cfg is None:
+        cfg = OutOfPlaneRotConfig()
+
+    if right_frames is None or len(right_frames) == 0:
+        return np.zeros((0,), dtype=np.float64), np.zeros((0,), dtype=np.float64)
+
+    n = int(len(right_frames))
+    cx0, cy0 = int(click_point_xy[0]), int(click_point_xy[1])
+    cell = int(cfg.cell_size)
+
+    # 3x3 cell center offsets (dx,dy): numbers follow
+    # 1 2 3
+    # 4 5 6
+    # 7 8 9
+    offsets = []
+    for ry, dy in enumerate([-cell, 0, cell]):
+        for rx, dx in enumerate([-cell, 0, cell]):
+            if cfg.exclude_center and dx == 0 and dy == 0:
+                continue
+            offsets.append((dx, dy))
+    offsets = offsets  # length 8 when exclude_center=True
+
+    beta = np.full((n,), np.nan, dtype=np.float64)
+    gamma = np.full((n,), np.nan, dtype=np.float64)
+
+    for i in range(n):
+        betas_k = []
+        gammas_k = []
+
+        img1 = _to_gray_float64(right_frames[i], cfg)
+
+        for k in range(1, int(cfg.lookahead) + 1):
+            j = i + k
+            if j >= n:
+                break
+            img2 = _to_gray_float64(right_frames[j], cfg)
+
+            pos_list = []
+            d_list = []
+
+            for (dx, dy) in offsets:
+                pcx = cx0 + dx
+                pcy = cy0 + dy
+                p1 = _extract_patch(img1, pcx, pcy, cell)
+                p2 = _extract_patch(img2, pcx, pcy, cell)
+                if p1 is None or p2 is None:
+                    continue
+
+                vx, vy, _ = _patch_flow_median(p1, p2, cfg)
+                if not np.isfinite(vx) or not np.isfinite(vy):
+                    continue
+
+                # position relative to center (use (x,z) convention: x=horizontal, z=vertical)
+                pos_list.append([float(dx), float(dy)])
+                d_list.append([float(vx), float(vy)])
+
+            if len(pos_list) < int(cfg.min_patches_for_fit):
+                continue
+
+            pos_arr = np.asarray(pos_list, dtype=np.float64)
+            d_arr = np.asarray(d_list, dtype=np.float64)
+
+            A = _fit_affine_from_patch_flows(pos_arr, d_arr)
+            if A is None:
+                continue
+
+            # shear-based angle proxies (small-angle)
+            beta_k = float(np.degrees(np.arctan(A[1, 0])))
+            gamma_k = float(np.degrees(np.arctan(A[0, 1])))
+
+            betas_k.append(beta_k)
+            gammas_k.append(gamma_k)
+
+        if len(betas_k) > 0:
+            beta[i] = float(np.median(betas_k))
+        if len(gammas_k) > 0:
+            gamma[i] = float(np.median(gammas_k))
+
+    # temporal median filter
+    beta_f = _median_filter_1d_nan(beta, int(cfg.time_median_win))
+    gamma_f = _median_filter_1d_nan(gamma, int(cfg.time_median_win))
+
+    # interp/extrap NaNs
+    beta_out = _interp_extrap_1d_nan(beta_f)
+    gamma_out = _interp_extrap_1d_nan(gamma_f)
+
+    return beta_out, gamma_out

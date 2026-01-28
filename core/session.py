@@ -87,6 +87,19 @@ class SessionState:
     # Stabilization transforms (optional debug record)
     stabilize_transforms: list = field(default_factory=list)
 
+    # --- NEW: per-frame relative motion from freehand (i -> i+1) ---
+    fh_dx_mm: Optional[np.ndarray] = None      # shape (n-1,)
+    fh_dz_mm: Optional[np.ndarray] = None      # shape (n-1,)
+    fh_dalpha_deg: Optional[np.ndarray] = None # shape (n-1,)
+    fh_dy_mm: Optional[np.ndarray] = None      # shape (n-1,) constant for now
+    # --------------------------------------------------------------
+    # Out-of-plane rotation (beta/gamma) results
+    # -------------------------
+    beta_deg: Optional[np.ndarray] = None   # per-frame beta (deg)
+    gamma_deg: Optional[np.ndarray] = None  # per-frame gamma (deg)
+
+
+
     def ensure_original_dims(self):
         """Populate original frame size from right_frames_original."""
         if self.right_frames_original is None or len(self.right_frames_original) == 0:

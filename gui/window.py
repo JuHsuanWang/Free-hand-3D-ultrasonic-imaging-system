@@ -59,26 +59,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_toggle_frames = QtWidgets.QPushButton("Close Frames")
         self.btn_toggle_pc = QtWidgets.QPushButton("Close Point Cloud")
         self.btn_show_y = QtWidgets.QPushButton("Show Y Heatmap")
+        self.btn_show_beta_gamma = QtWidgets.QPushButton("Show β/γ Rotation")
 
         btn_font = QtGui.QFont("Microsoft JhengHei UI", 12, QtGui.QFont.Bold)
         self.btn_toggle_frames.setFont(btn_font)
         self.btn_toggle_pc.setFont(btn_font)
         self.btn_show_y.setFont(btn_font)
+        self.btn_show_beta_gamma.setFont(btn_font)
 
         panel_layout.addWidget(self.btn_toggle_frames)
         panel_layout.addWidget(self.btn_toggle_pc)
         panel_layout.addWidget(self.btn_show_y)
+        panel_layout.addWidget(self.btn_show_beta_gamma)
+
         
         # overlay checkboxes (bottom)
-        self.chk_red_box = QtWidgets.QCheckBox("Show Red Box (Crop)")
-        self.chk_yellow_box = QtWidgets.QCheckBox("Show Yellow Band (456)")
+        self.chk_red_box = QtWidgets.QCheckBox("Show Red Box")
+        self.chk_yellow_box = QtWidgets.QCheckBox("Show Yellow Band")
+        self.chk_orange_grid = QtWidgets.QCheckBox("Show Orange 3x3 Grid")
 
         self.chk_red_box.setChecked(True)
         self.chk_yellow_box.setChecked(True)
+        self.chk_orange_grid.setChecked(True)
 
         panel_layout.addSpacing(10)
         panel_layout.addWidget(self.chk_red_box)
         panel_layout.addWidget(self.chk_yellow_box)
+        panel_layout.addWidget(self.chk_orange_grid)
+
 
 
         panel_layout.addStretch(1)
@@ -98,8 +106,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_toggle_frames.clicked.connect(self._on_toggle_frames)
         self.btn_toggle_pc.clicked.connect(self._on_toggle_point_cloud)
         self.btn_show_y.clicked.connect(self._on_show_y_heatmap)
+        self.btn_show_beta_gamma.clicked.connect(self._on_show_beta_gamma)
         self.chk_red_box.toggled.connect(self._on_toggle_red_box)
         self.chk_yellow_box.toggled.connect(self._on_toggle_yellow_band)
+        self.chk_orange_grid.toggled.connect(self._on_toggle_orange_grid)
 
         # Build initial scene
         self.ctrl.build_initial_scene()
@@ -128,3 +138,16 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_toggle_yellow_band(self, checked: bool):
         self.ctrl.toggle_band_box(checked)
 
+    def _on_toggle_orange_grid(self, checked: bool):
+        self.ctrl.toggle_grid9_box(checked)
+
+
+    def _on_show_beta_gamma(self):
+        if not self.sess.selection_confirmed:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Show β/γ Rotation",
+                "Please finish ROI/crop selection and run processing first."
+            )
+            return
+        self.ctrl.on_show_beta_gamma()

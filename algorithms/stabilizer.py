@@ -231,6 +231,7 @@ class SequenceStabilizer:
         Also optionally saves debug images R_XXXX_dbg.png with EXACT third-code style.
         """
         n = len(right_frames)
+        transforms = []  # list of dict: {"i": i, "theta_rad":..., "tx_px":..., "tz_px":...}
         if n < 2:
             return right_frames, left_frames
 
@@ -283,6 +284,13 @@ class SequenceStabilizer:
                     P_local.append([lx, lz])
                     Q_local.append([lx + dx, lz + dz])
 
+            transforms.append({
+                "i": int(i),
+                "theta_rad": 0.0,
+                "tx_px": 0.0,
+                "tz_px": 0.0,
+            })
+
             # Not enough correspondences -> skip stabilization for this frame
             if len(P_local) < 6:
                 # still allow debug output (theta/tx/tz = 0), matching third-code behavior
@@ -327,6 +335,13 @@ class SequenceStabilizer:
                 P_global, Q_global, dx_mm=self.cfg.dx_mm, dz_mm=self.cfg.dz_mm
             )
 
+            transforms.append({
+                "i": int(i),
+                "theta_rad": float(theta),
+                "tx_px": float(tx),
+                "tz_px": float(tz),
+            })
+
             right_frames[i] = warp_back_to_ref(right_frames[i], theta, tx, tz)
             left_frames[i] = warp_back_to_ref(left_frames[i], theta, tx, tz)
 
@@ -367,4 +382,5 @@ class SequenceStabilizer:
             ref_crop_gray = ref_full_gray[crop_y1:crop_y1 + self.cfg.crop_size,
                                           crop_x1:crop_x1 + self.cfg.crop_size]
 
-        return right_frames, left_frames
+        return right_frames, left_frames, transforms
+
