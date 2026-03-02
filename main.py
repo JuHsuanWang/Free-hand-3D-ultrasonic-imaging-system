@@ -30,6 +30,9 @@ def main():
     left_video = "Ln.avi"
     right_video = "Rn.avi"
 
+    #left_video = "Right_Phantom2_2.avi"
+    #right_video = "Left_Phantom2_2.avi"
+
     if len(sys.argv) >= 3:
         left_video = sys.argv[1]
         right_video = sys.argv[2]

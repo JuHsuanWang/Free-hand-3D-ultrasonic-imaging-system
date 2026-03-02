@@ -69,6 +69,14 @@ class SessionState:
 
     # Segmentation results: list of (M,2) points for each frame
     contour_points_list: List[np.ndarray] = field(default_factory=list)
+
+    # --- NEW: Manual Labeling Storage ---
+    # Stores the user-drawn contours for specific frames.
+    # Key: frame_index (int)
+    # Value: List of (u, v) tuples representing 2D image coordinates.
+    # These coordinates are independent of 3D rotation (beta/gamma).
+    manual_contours: Dict[int, List[Tuple[float, float]]] = field(default_factory=dict)
+
     # -------------------------
     # Out-of-plane (Y) heatmap results
     # -------------------------
@@ -83,6 +91,8 @@ class SessionState:
     # 3D overlay toggles
     crop_box_visible: bool = True     # red box
     band_box_visible: bool = True     # yellow band
+    grid9_visible: bool = True       # orange 3x3 grid
+
 
     # Stabilization transforms (optional debug record)
     stabilize_transforms: list = field(default_factory=list)

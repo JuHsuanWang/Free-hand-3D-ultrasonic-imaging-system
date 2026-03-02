@@ -1,6 +1,6 @@
 # gui/visualizer.py
 from __future__ import annotations
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 import os
 import cv2
 import numpy as np
@@ -58,7 +58,27 @@ class VisualizerController:
         self.heatmap_overlay_label = None
         self._plane_records = []  # store meshes + base points for out-of-plane update
 
+        # --- Labeling State ---
+        self.is_labeling = False
+        # slider-selected frame (may not be rendered)
+        self.active_frame_idx = -1
+        # actual rendered frame index used for labeling (snapped to render_stride)
+        self.active_rendered_frame_idx = -1
+        # build_3d_view renders only every N frames
+        self.render_stride = 10
+        # map rendered frame_idx -> actors for quick show/hide during labeling
+        self.frame_actor_map = {}  # {frame_idx: {"full":actor, "crop":actor, "red":actor, "yellow":actor, "grid":actor}}
+        self.temp_label_actor = None                 # The green line currently being drawn
+        self.temp_label_points_actor = None
+        self._temp_polyline = None
+        self._temp_points = None
 
+        self.existing_label_actors = {}              # {frame_idx: pv.Actor}
+        # --- NEW: 2D labeling view actors (single plane) ---
+        self.label2d_full_actor = None
+        self._surface_built_once = False
+
+       
     # -------------------------
     # UI helpers
     # -------------------------
@@ -201,13 +221,12 @@ class VisualizerController:
             updated += 1
 
         print(f"[OOP] updated {updated} planes using beta/gamma")
-        self.plotter.render()
-
-
-    def toggle_point_cloud(self):
-        self.sess.point_cloud_visible = not self.sess.point_cloud_visible
-        self._set_actor_visibility(self.point_cloud_actor, self.sess.point_cloud_visible)
-        self._set_actor_visibility(self.surface_actor, self.sess.point_cloud_visible)
+        # --- NEW: Sync manual labels with new rotation ---
+        # This ensures that user-drawn lines rotate along with the frames.
+        if getattr(self.sess, "manual_contours", None):
+            # only update surface if user has generated it before
+            if getattr(self, "_surface_built_once", False):
+                self.generate_surface_from_labels()
         self.plotter.render()
 
     def toggle_crop_box(self, visible: bool):
@@ -719,7 +738,6 @@ class VisualizerController:
         if len(contours) == 0:
             return np.empty((0, 2), dtype=np.float32)
 
-        all_points = []
         for contour in contours:
             area = cv2.contourArea(contour)
             if area >= self.cfg.min_contour_area:
@@ -857,16 +875,25 @@ class VisualizerController:
         # --- NEW: GT plot (optional) ---
         if bool(self.cfg.enable_gt_plot):
             try:
-                from analysis.gt_plot import load_em_perframe_motion, plot_gt_summary
+                from analysis.gt_plot import (
+                    load_em_perframe_motion,
+                    plot_gt_summary,
+                    write_alpha_beta_gamma_quat_csv,
+                )
+
+                # Ensure beta/gamma exists (so we can write quaternion CSV)
+                if self.sess.beta_deg is None or self.sess.gamma_deg is None:
+                    self.compute_beta_gamma_out_of_plane()
 
                 # load EM per-frame motion
                 em = load_em_perframe_motion(
                     tracker_csv_path=self.cfg.tracker_csv_path,
                     port=self.cfg.tracker_port,
-                    axis_map={"x": "Tx", "y": "Ty", "z": "Tz"},  # 若你之後要換軸，在這裡改
+                    axis_map={"x": "Tx", "y": "Ty", "z": "Tz"},
                 )
 
-                out_png = os.path.join(os.path.dirname(self.cfg.png_out_dir.rstrip("/\\")), self.cfg.gt_plot_filename)
+                base_dir = os.path.dirname(self.cfg.png_out_dir.rstrip("/\\"))
+                out_png = os.path.join(base_dir, self.cfg.gt_plot_filename)
 
                 plot_gt_summary(
                     out_png_path=out_png,
@@ -879,11 +906,34 @@ class VisualizerController:
                     em_dz_mm=np.asarray(em["em_dz_mm"], dtype=np.float64),
                     em_dalpha_deg=np.asarray(em["em_dalpha_deg"], dtype=np.float64),
                 )
-
                 print(f"[GT] Saved comparison plot: {out_png}")
+
+                # -----------------------------
+                # Quaternion CSV export
+                # -----------------------------
+                # Build per-frame alpha(t) from per-step delta alpha (alpha[0]=0)
+                dalpha = np.asarray(self.sess.fh_dalpha_deg, dtype=np.float64).reshape(-1)
+                n_frames = int(len(self.sess.right_frames)) if self.sess.right_frames is not None else int(dalpha.size + 1)
+                alpha_pf = np.zeros((n_frames,), dtype=np.float64)
+                if dalpha.size > 0:
+                    m = min(n_frames - 1, int(dalpha.size))
+                    alpha_pf[1:m+1] = np.cumsum(dalpha[:m])
+
+                beta_pf = np.asarray(self.sess.beta_deg, dtype=np.float64).reshape(-1)
+                gamma_pf = np.asarray(self.sess.gamma_deg, dtype=np.float64).reshape(-1)
+
+                out_csv = os.path.join(base_dir, "alpha_beta_gamma_quat.csv")
+                write_alpha_beta_gamma_quat_csv(
+                    out_csv_path=out_csv,
+                    alpha_deg_per_frame=alpha_pf,
+                    beta_deg_per_frame=beta_pf,
+                    gamma_deg_per_frame=gamma_pf,
+                )
+                print(f"[GT] Saved quaternion CSV: {out_csv}")
+
             except Exception as e:
-                print(f"[GT] Plot failed: {e}")
-        # -------------------------------
+                print(f"[GT] Plot/CSV failed: {e}")
+            # -------------------------------
 
         self.plotter.render()
 
@@ -1072,7 +1122,7 @@ class VisualizerController:
             return
 
         if self.sess.y_heatmap is None or self.sess.y_heatmap.size == 0:
-            self.update_status("Computing out-of-plane (Y) heatmap (MATLAB-like)...")
+            self.update_status("Computing out-of-plane (Y) heatmap ...")
             self.plotter.render()
             self.compute_y_heatmap_like_matlab()
             self.update_status("Ready.")
@@ -1098,11 +1148,15 @@ class VisualizerController:
             max_displacement=150.0,
             det_thresh=1e-6,
             lookahead=10,
-            time_median_win=5,
+
+            enable_time_median_filter=bool(self.cfg.enable_beta_gamma_median_filter),
+            time_median_win=int(self.cfg.beta_gamma_median_win),
+
             cell_size=int(self.cfg.crop_size),   # 100
             exclude_center=True,
             min_patches_for_fit=4,
         )
+
 
         beta, gamma = compute_beta_gamma_from_right_grid(
             self.sess.right_frames,
@@ -1258,6 +1312,544 @@ class VisualizerController:
         except Exception as e:
             print(f"Surface reconstruction failed: {e}")
             return None
+        
+    def _hide_all_3d_actors_for_labeling(self):
+        # Hide stacked frames + overlays
+        for a in getattr(self, "frame_actors", []):
+            self._set_actor_visibility(a, False)
+        for a in getattr(self, "crop_border_actors", []):
+            self._set_actor_visibility(a, False)
+        for a in getattr(self, "band_border_actors", []):
+            self._set_actor_visibility(a, False)
+        for a in getattr(self, "grid9_border_actors", []):
+            self._set_actor_visibility(a, False)
+
+        # Hide cloud/surface to make view clean
+        self._set_actor_visibility(self.point_cloud_actor, False)
+        self._set_actor_visibility(self.surface_actor, False)
+
+        # Also hide any existing yellow label lines while labeling (optional)
+        for act in getattr(self, "existing_label_actors", {}).values():
+            self._set_actor_visibility(act, False)
+
+    def _restore_3d_actors_after_labeling(self):
+        # Restore stacked frames
+        for a in getattr(self, "frame_actors", []):
+            self._set_actor_visibility(a, self.sess.frames_visible)
+
+        # Restore overlays based on toggles
+        for a in getattr(self, "crop_border_actors", []):
+            self._set_actor_visibility(a, self.sess.crop_box_visible)
+        for a in getattr(self, "band_border_actors", []):
+            self._set_actor_visibility(a, self.sess.band_box_visible)
+        for a in getattr(self, "grid9_border_actors", []):
+            self._set_actor_visibility(a, getattr(self.sess, "grid9_visible", True))
+
+        # Restore cloud/surface based on toggle
+        self._set_actor_visibility(self.point_cloud_actor, self.sess.point_cloud_visible)
+        self._set_actor_visibility(self.surface_actor, self.sess.point_cloud_visible)
+
+        # Restore existing yellow label lines
+        for act in getattr(self, "existing_label_actors", {}).values():
+            self._set_actor_visibility(act, True)
+
+    def _enter_2d_label_view(self, frame_idx: int):
+        """
+        2D labeling view:
+        - show only the crop plane (opaque) facing camera
+        - reset camera so the plane is front-facing
+        - use track_click_position (no picking) for stability
+        """
+        if self.sess.right_frames is None or len(self.sess.right_frames) == 0:
+            return
+
+        idx = int(max(0, min(frame_idx, len(self.sess.right_frames) - 1)))
+        self.active_frame_idx = idx
+
+        # clean view
+        self._hide_all_3d_actors_for_labeling()
+
+        # lock to 2D interaction (no rotate) during labeling view
+        try:
+            self.plotter.enable_image_style()
+        except Exception:
+            pass
+
+        # remove previous 2D actors
+        if self.label2d_full_actor is not None:
+            try: self.plotter.remove_actor(self.label2d_full_actor)
+            except Exception: pass
+            self.label2d_full_actor = None
+        
+        # --- Build a single ROI plane at y=0 (full cyan ROI) ---
+        frame = self.sess.right_frames[idx]
+        if frame.ndim == 3 and frame.shape[2] == 4:
+            rgba = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGBA)
+        else:
+            rgba = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        tex = pv.numpy_to_texture(rgba)
+
+        w = int(self.sess.frame_w)
+        h = int(self.sess.frame_h)
+
+        pts = np.array([
+            [0.0, 0.0, float(h)],
+            [float(w), 0.0, float(h)],
+            [float(w), 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ], dtype=np.float32)
+
+        faces = np.array([[4, 0, 1, 2, 3]], dtype=np.int64)
+        mesh = pv.PolyData(pts, faces)
+        mesh.active_texture_coordinates = np.array(
+            [[0, 1], [1, 1], [1, 0], [0, 0]], dtype=np.float32
+        )
+
+        # OPAQUE crop
+        self.label2d_full_actor = self.plotter.add_mesh(mesh, texture=tex, opacity=1.0)
+
+        # --- Camera: face the plane (front view) + reset ---
+        center_x = float(w) * 0.5
+        center_z = float(h) * 0.5
+        dist = max(w, h) * 1.2
+
+        self.plotter.camera.position = (center_x, -dist, center_z)
+        self.plotter.camera.focal_point = (center_x, 0.0, center_z)
+        self.plotter.camera.up = (0, 0, 1)
+        try:
+            self.plotter.reset_camera()
+        except Exception:
+            pass
+
+        # IMPORTANT: use track_click_position (no point picking)
+        self.plotter.track_click_position(callback=self.on_label_click_2d, side="left")
+
+        self._redraw_current_temp_label_2d()
+        self.plotter.render()
+
+    def _exit_2d_label_view(self):
+        # remove 2D full ROI actor
+        if self.label2d_full_actor is not None:
+            try:
+                self.plotter.remove_actor(self.label2d_full_actor)
+            except Exception:
+                pass
+            self.label2d_full_actor = None
+
+        # restore 3D
+        self._restore_3d_actors_after_labeling()
+        try:
+            self.plotter.enable_trackball_style()
+        except Exception:
+            pass
+
+        self.plotter.render()
+
+
+    def on_label_click_2d(self, point):
+        """
+        point: world coordinate on y=0 plane
+        convert to (u,v) in ROI image coordinates and store
+        """
+        if not self.is_labeling or self.active_frame_idx < 0:
+            return
+
+        wx = float(point[0])
+        wz = float(point[2])
+
+        # clamp to ROI bounds
+        wx = max(0.0, min(float(self.sess.frame_w - 1), wx))
+        wz = max(0.0, min(float(self.sess.frame_h - 1), wz))
+
+        u = wx
+        v = float(self.sess.frame_h) - wz
+
+        idx = int(self.active_frame_idx)
+        if idx not in self.sess.manual_contours:
+            self.sess.manual_contours[idx] = []
+        self.sess.manual_contours[idx].append((u, v))
+
+        self._redraw_current_temp_label_2d()
+
+    # -------------------------
+    # Manual Labeling & 3D Interaction
+    # -------------------------
+    def start_labeling_mode(self, frame_idx: int):
+        """Enter 2D labeling mode (ROI plane, opaque, no rotate)."""
+        self.is_labeling = True
+        self.active_frame_idx = int(frame_idx)
+
+        # force 2D interaction (no rotate)
+        try:
+            self.plotter.enable_image_style()
+        except Exception:
+            pass
+
+        self.update_status(
+            f"2D Labeling (step=10)\n"
+            f"Frame: {self.active_frame_idx}\n"
+            "Click: add point | Drag: pan | Wheel: zoom | 'z': undo"
+        )
+
+        # bind undo
+        try:
+            self.plotter.add_key_event("z", self.undo_last_point)
+        except Exception:
+            pass
+
+        # show 2D ROI plane for this frame
+        self._enter_2d_label_view(self.active_frame_idx)
+
+    def stop_labeling_mode(self):
+        """Exit labeling mode and restore 3D view."""
+        self.is_labeling = False
+
+        # remove temp line
+        if self.temp_label_actor:
+            try:
+                self.plotter.remove_actor(self.temp_label_actor)
+            except Exception:
+                pass
+            self.temp_label_actor = None
+
+        # remove temp points
+        if getattr(self, "temp_label_points_actor", None):
+            try:
+                self.plotter.remove_actor(self.temp_label_points_actor)
+            except Exception:
+                pass
+            self.temp_label_points_actor = None
+
+        self._exit_2d_label_view()
+        # --- NEW: force frames back on (so 3D stack is visible) ---
+        self.sess.frames_visible = True
+        for a in getattr(self, "frame_actors", []):
+            self._set_actor_visibility(a, True)
+
+        # --- NEW: restore a sensible 3D camera ---
+        try:
+            self.plotter.camera_position = "iso"
+            self.plotter.reset_camera()
+        except Exception:
+            pass
+
+        self.update_status("Labeling Finished. You can generate 3D surface.")
+        self.plotter.render()
+
+    def set_active_labeling_frame(self, idx: int):
+        """Update labeling frame (snap to 10 frames) and refresh 2D ROI view."""
+        step = 10
+        idx = int(round(int(idx) / step) * step)
+
+        n = len(self.sess.right_frames) if self.sess.right_frames is not None else 0
+        if n <= 0:
+            return
+
+        idx = max(0, min(n - 1, idx))
+        self.active_frame_idx = idx
+
+        self.update_status(
+            f"2D Labeling (step=10)\n"
+            f"Frame: {self.active_frame_idx}\n"
+            "Click: add point | Drag: pan | Wheel: zoom | 'z': undo"
+        )
+
+        if self.is_labeling:
+            self._enter_2d_label_view(self.active_frame_idx)
+        else:
+            # not in labeling mode: just redraw status
+            self.plotter.render()
+
+
+    def undo_last_point(self):
+        """Removes the last added point for the current frame."""
+        if self.active_frame_idx in self.sess.manual_contours:
+            if self.sess.manual_contours[self.active_frame_idx]:
+                self.sess.manual_contours[self.active_frame_idx].pop()
+                if self.is_labeling:
+                    self._redraw_current_temp_label_2d()
+                else:
+                    self._redraw_current_temp_label()
+
+
+    def clear_label_for_frame(self, idx: int):
+        """Deletes all points for a specific frame."""
+        if idx in self.sess.manual_contours:
+            del self.sess.manual_contours[idx]
+        if idx in self.existing_label_actors:
+            self.plotter.remove_actor(self.existing_label_actors[idx])
+            del self.existing_label_actors[idx]
+        if self.active_frame_idx == idx:
+            if self.is_labeling:
+                self._redraw_current_temp_label_2d()
+            else:
+                self._redraw_current_temp_label()
+
+
+    def _redraw_current_temp_label_2d(self):
+        """
+        Fast 2D redraw:
+        - DO NOT remove/add actors (avoid flicker)
+        - Update mapper input in-place
+        """
+        idx = int(self.active_frame_idx)
+        pts2d = self.sess.manual_contours.get(idx, None)
+        if not pts2d:
+            # hide actors if no points
+            self._set_actor_visibility(self.temp_label_actor, False)
+            self._set_actor_visibility(self.temp_label_points_actor, False)
+            return
+
+        crop_h = int(self.sess.frame_h)
+        y_eps = -0.5
+
+        # build 3D points on y=y_eps plane
+        pts = np.empty((len(pts2d), 3), dtype=np.float32)
+        for k, (u, v) in enumerate(pts2d):
+            x = float(u)
+            z = float(crop_h) - float(v)
+            pts[k] = (x, y_eps, z)
+
+        # --- points actor (immediate feedback even with 1 point) ---
+        cloud = pv.PolyData(pts)
+        if self.temp_label_points_actor is None:
+            self.temp_label_points_actor = self.plotter.add_mesh(
+                cloud,
+                color="lime",
+                point_size=10,
+                render_points_as_spheres=True,
+                lighting=False,
+            )
+        else:
+            try:
+                self.temp_label_points_actor.mapper.SetInputData(cloud)
+                self._set_actor_visibility(self.temp_label_points_actor, True)
+            except Exception:
+                # fallback: recreate once if mapper update fails
+                try:
+                    self.plotter.remove_actor(self.temp_label_points_actor)
+                except Exception:
+                    pass
+                self.temp_label_points_actor = self.plotter.add_mesh(
+                    cloud, color="lime", point_size=10, render_points_as_spheres=True, lighting=False
+                )
+
+        # --- polyline actor (only when >=2 pts) ---
+        if len(pts) < 2:
+            self._set_actor_visibility(self.temp_label_actor, False)
+            self.plotter.render()
+            return
+
+        poly = pv.lines_from_points(pts, close=False)
+        if self.temp_label_actor is None:
+            self.temp_label_actor = self.plotter.add_mesh(
+                poly,
+                color="lime",
+                line_width=5,
+                render_lines_as_tubes=True,
+                lighting=False,
+            )
+        else:
+            try:
+                self.temp_label_actor.mapper.SetInputData(poly)
+                self._set_actor_visibility(self.temp_label_actor, True)
+            except Exception:
+                try:
+                    self.plotter.remove_actor(self.temp_label_actor)
+                except Exception:
+                    pass
+                self.temp_label_actor = self.plotter.add_mesh(
+                    poly, color="lime", line_width=5, render_lines_as_tubes=True, lighting=False
+                )
+
+        self.plotter.render()
+
+
+    def _redraw_current_temp_label(self):
+        """Draws the green line (in-progress) for the active frame."""
+        if self.temp_label_actor:
+            self.plotter.remove_actor(self.temp_label_actor)
+            self.temp_label_actor = None
+            
+        idx = self.active_frame_idx
+        if idx not in self.sess.manual_contours or len(self.sess.manual_contours[idx]) < 2:
+            return
+
+        points_2d = self.sess.manual_contours[idx]
+        pts_3d = []
+        
+        y_pos = idx * self.cfg.y_spacing
+        center = np.array([self.sess.frame_w * 0.5, y_pos, self.sess.frame_h * 0.5], dtype=np.float32)
+        beta = self.sess.beta_deg[idx] if (self.sess.beta_deg is not None and idx < len(self.sess.beta_deg)) else 0.0
+        gamma = self.sess.gamma_deg[idx] if (self.sess.gamma_deg is not None and idx < len(self.sess.gamma_deg)) else 0.0
+
+        for (u, v) in points_2d:
+            wx, wy, wz = full_img_to_world_3d(u, v, idx, self.sess.frame_h, self.cfg.y_spacing)
+            pts_3d.append([wx, wy, wz])
+        
+        pts_3d.append(pts_3d[0]) # Close loop
+        
+        pts_array = np.array(pts_3d, dtype=np.float32)
+        pts_rot = self._rotate_points_beta_gamma(pts_array, center, beta, gamma)
+        
+        poly = pv.lines_from_points(pts_rot, close=False)
+        self.temp_label_actor = self.plotter.add_mesh(poly, color="lime", line_width=3)
+
+
+    def generate_surface_from_labels(self):
+        """
+        Re-calculates 3D positions from 2D manual labels (applying current beta/gamma)
+        and reconstructs the surface.
+        """
+        self.update_status("Generating surface from manual labels...")
+        sorted_indices = sorted(self.sess.manual_contours.keys())
+        rings = []
+        ring_frame_ids = []
+        if not sorted_indices:
+            # If called automatically but no labels exist, just return silently
+            return
+        
+        # Cleanup
+        if self.point_cloud_actor:
+            try: self.plotter.remove_actor(self.point_cloud_actor)
+            except Exception: pass
+        if self.surface_actor:
+            try: self.plotter.remove_actor(self.surface_actor)
+            except Exception: pass
+
+        for act in self.existing_label_actors.values():
+            self.plotter.remove_actor(act)
+        self.existing_label_actors.clear()
+
+        # cleanup temp labeling actors too
+        if getattr(self, "temp_label_actor", None):
+            try: self.plotter.remove_actor(self.temp_label_actor)
+            except Exception: pass
+            self.temp_label_actor = None
+
+        if getattr(self, "temp_label_points_actor", None):
+            try: self.plotter.remove_actor(self.temp_label_points_actor)
+            except Exception: pass
+            self.temp_label_points_actor = None
+        
+        def _resample_closed_curve_xyz(pts_xyz: np.ndarray, m: int = 64) -> np.ndarray:
+            """
+            Resample a closed 3D polyline to exactly m points (uniform arc-length).
+            pts_xyz: (N,3) WITHOUT repeating the first point at the end.
+            returns: (m,3) WITHOUT repeating the first point.
+            """
+            pts = np.asarray(pts_xyz, dtype=np.float32)
+            if len(pts) < 3:
+                return pts
+
+            # close it (for arc-length)
+            closed = np.vstack([pts, pts[0]])
+            seg = np.linalg.norm(np.diff(closed, axis=0), axis=1)
+            s = np.concatenate([[0.0], np.cumsum(seg)])
+            if s[-1] <= 1e-6:
+                return np.repeat(pts[:1], m, axis=0)
+
+            t = np.linspace(0.0, s[-1], m + 1)[:-1]  # exclude endpoint to avoid duplicate of start
+            out = np.zeros((m, 3), dtype=np.float32)
+            for d in range(3):
+                out[:, d] = np.interp(t, s, closed[:, d])
+            return out
+
+
+        for idx in sorted_indices:
+            pts_2d = self.sess.manual_contours[idx]
+            if len(pts_2d) < 3: continue
+            
+            y_pos = idx * self.cfg.y_spacing
+            center = np.array([self.sess.frame_w * 0.5, y_pos, self.sess.frame_h * 0.5], dtype=np.float32)
+            beta = self.sess.beta_deg[idx] if (self.sess.beta_deg is not None and idx < len(self.sess.beta_deg)) else 0.0
+            gamma = self.sess.gamma_deg[idx] if (self.sess.gamma_deg is not None and idx < len(self.sess.gamma_deg)) else 0.0
+
+            # Convert 2D -> 3D
+            raw_3d = []
+            for (u, v) in pts_2d:
+                wx, wy, wz = full_img_to_world_3d(u, v, idx, self.sess.frame_h, self.cfg.y_spacing)
+                raw_3d.append([wx, wy, wz])
+            
+            # Draw Yellow Line
+            loop_pts = np.array(raw_3d + [raw_3d[0]], dtype=np.float32)
+            rot_loop = self._rotate_points_beta_gamma(loop_pts, center, beta, gamma)
+            poly_y = pv.lines_from_points(rot_loop, close=False)
+            act = self.plotter.add_mesh(poly_y, color="yellow", line_width=2)
+            self.existing_label_actors[idx] = act
+
+            # --- NEW: resample this ring to fixed M points for lofting ---
+            contour_arr = np.array(raw_3d, dtype=np.float32)          # (N,3) in world (unrotated)
+            rot_ring = self._rotate_points_beta_gamma(contour_arr, center, beta, gamma)  # (N,3)
+            M = 64
+            rot_ring = _resample_closed_curve_xyz(rot_ring, m=M)  # (M,3) no duplicate
+            # --- NEW: align ring start index to avoid twisted/incorrect connectivity ---
+            start_idx = int(np.argmax(rot_ring[:, 0]))  # pick max-x as canonical start
+            rot_ring = np.roll(rot_ring, -start_idx, axis=0)
+
+            rot_ring_closed = np.vstack([rot_ring, rot_ring[0]])    # (M+1,3) close seam
+            rings.append(rot_ring_closed)
+
+
+
+        if len(rings) < 2:
+            self.update_status("Need at least 2 frames to build a surface.")
+            return
+
+        # Stack rings into a StructuredGrid: dims = (M, num_rings, 1)
+        num_rings = len(rings)
+        M = rings[0].shape[0]
+
+        P = np.stack(rings, axis=1)  # (M, num_rings, 3)
+        X = P[:, :, 0].reshape(M, num_rings, 1)
+        Y = P[:, :, 1].reshape(M, num_rings, 1)
+        Z = P[:, :, 2].reshape(M, num_rings, 1)
+
+        grid = pv.StructuredGrid(X, Y, Z)
+        surf = grid.extract_surface().triangulate()
+
+        # --- NEW: Cap the open ends using fill_holes ---
+        # Instead of adding geometry (cone), we use a filter to find open edges
+        # (the first and last rings) and patch them with a surface.
+        try:
+            # hole_size=1000 is an arbitrary large number to ensure the end caps are filled.
+            surf = surf.fill_holes(100000)
+        except Exception as e:
+            print(f"Warning: Could not fill holes: {e}")
+        # -----------------------------------------------
+
+        # Render surface
+
+        # Render surface
+        if self.surface_actor:
+            try: self.plotter.remove_actor(self.surface_actor)
+            except Exception: pass
+
+        self.surface_actor = self.plotter.add_mesh(
+            surf, color="lime", opacity=0.5, smooth_shading=True
+        )
+
+        # If you still want a point cloud for debugging, use ring points (already downsampled)
+        cloud_pts = P.reshape(-1, 3)
+        cloud = pv.PolyData(cloud_pts)
+        if self.point_cloud_actor:
+            try: self.plotter.remove_actor(self.point_cloud_actor)
+            except Exception: pass
+        self.point_cloud_actor = self.plotter.add_mesh(
+            cloud, color="cyan", point_size=6, render_points_as_spheres=True
+        )
+        self._surface_built_once = True
+        self.update_status(f"Surface generated from {len(rings)} frames, {M} pts/ring.")
+        try:
+            self.sess.point_cloud_visible = True
+            self._set_actor_visibility(self.point_cloud_actor, True)
+            self._set_actor_visibility(self.surface_actor, True)
+            self.plotter.reset_camera()
+        except Exception:
+            pass
+
+        self.plotter.render()
+
 
     def build_3d_view(self):
         """Render stacked image planes + crop planes + contour point cloud/surface."""
@@ -1275,8 +1867,9 @@ class VisualizerController:
         all_contour_points = []
         self._plane_records = []
 
-        # Render every 5 frames (same as your original)
-        for i in range(0, n, 5):
+        # Render every N frames
+        stride = int(getattr(self, "render_stride", 5))
+        for i in range(0, n, stride):
             y_pos = i * self.cfg.y_spacing
             # --- NEW: yellow band border (4-5-6 row) for THIS frame y_pos ---
             cell = int(self.cfg.crop_size)
@@ -1448,7 +2041,13 @@ class VisualizerController:
         self.crop_border_actors = []
         self.band_border_actors = []
         self.grid9_border_actors = []
-        for data in all_meshes:
+        self.frame_actor_map = {}
+
+        stride = int(getattr(self, "render_stride", 5))
+        for k, data in enumerate(all_meshes):
+            # rendered frame index = k * stride (because build loop is 0, stride, 2*stride, ...)
+            frame_idx = int(k * stride)
+
             a_full = self.plotter.add_mesh(data["full"][0], texture=data["full"][1], opacity=0.15)
             a_crop = self.plotter.add_mesh(data["crop"][0], texture=data["crop"][1], opacity=0.95)
 
@@ -1467,6 +2066,9 @@ class VisualizerController:
                 color="yellow",
                 line_width=2
             )
+            self._set_actor_visibility(a_band_border, self.sess.band_box_visible)
+            self.band_border_actors.append(a_band_border)
+
             # orange 3x3 grid
             a_grid9 = self.plotter.add_mesh(
                 data["grid9_border"],
@@ -1476,38 +2078,26 @@ class VisualizerController:
             self._set_actor_visibility(a_grid9, getattr(self.sess, "grid9_visible", True))
             self.grid9_border_actors.append(a_grid9)
 
-            self._set_actor_visibility(a_band_border, self.sess.band_box_visible)
-            self.band_border_actors.append(a_band_border)
-
             self.frame_actors.extend([a_full, a_crop])
+
+            # IMPORTANT: actor map for labeling show/hide
+            self.frame_actor_map[frame_idx] = {
+                "full": a_full,
+                "crop": a_crop,
+                "red": a_crop_border,
+                "yellow": a_band_border,
+                "grid": a_grid9,
+            }
 
         # Render point cloud + surface
         self.point_cloud_actor = None
         self.surface_actor = None
 
-        if len(all_contour_points) > 0:
-            raw_pts = np.asarray(all_contour_points, dtype=np.float32)
-            ds_pts = self.downsample_point_cloud(raw_pts)
-            print(f"  Point cloud: raw={len(raw_pts)}, downsampled={len(ds_pts)}")
-
-            if self.cfg.enable_point_cloud and len(ds_pts) > 0:
-                cloud = pv.PolyData(ds_pts)
-                self.point_cloud_actor = self.plotter.add_mesh(
-                    cloud,
-                    color="yellow",
-                    point_size=3,
-                    render_points_as_spheres=True,
-                    style="points"
-                )
-
-            if self.cfg.enable_surface and len(ds_pts) > 50:
-                surf = self.reconstruct_surface(ds_pts)
-                if surf is not None and surf.n_points > 0:
-                    self.surface_actor = self.plotter.add_mesh(
-                        surf,
-                        opacity=float(self.cfg.surface_opacity),
-                        smooth_shading=True
-                    )
+        # --- REPLACED: No more automatic RANSAC / Otsu cloud generation ---
+        # Instead, we check if there are existing manual labels and render them.
+        if self.sess.manual_contours:
+            self.generate_surface_from_labels()
+        # ------------------------------------------------------------------
 
         self.plotter.add_axes(xlabel="X", ylabel="Y (Frame)", zlabel="Z")
         self.plotter.camera_position = "iso"

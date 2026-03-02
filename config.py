@@ -47,14 +47,10 @@ class AppConfig:
 
     # Stabilization debug
     save_stab_debug: bool = True
-
-    # Point cloud / surface
-    enable_surface: bool = False
-    enable_point_cloud: bool = True
-    voxel_size: float = 6.0
-    max_points: int = 12000
-    surface_alpha: float = 25.0
-    surface_opacity: float = 0.35
+    
+    # --- Out-of-plane rotation (beta/gamma) post-processing ---
+    enable_beta_gamma_median_filter: bool = False
+    beta_gamma_median_win: int = 5
 
     crop_top_frac: float = 0.25    # Clear ROI upper 10% points
     enable_crop_top: bool = True    

@@ -294,6 +294,7 @@ class OutOfPlaneRotConfig:
 
     # motion aggregation
     lookahead: int = 5                 # compare frame i with i+1..i+lookahead
+    enable_time_median_filter: bool = True
     time_median_win: int = 5           # temporal median filter window (odd suggested)
 
     # 3x3 cell geometry (in ROI pixel coordinates)
@@ -558,9 +559,14 @@ def compute_beta_gamma_from_right_grid(
         if len(gammas_k) > 0:
             gamma[i] = float(np.median(gammas_k))
 
-    # temporal median filter
-    beta_f = _median_filter_1d_nan(beta, int(cfg.time_median_win))
-    gamma_f = _median_filter_1d_nan(gamma, int(cfg.time_median_win))
+        # temporal median filter (optional)
+        if bool(getattr(cfg, "enable_time_median_filter", True)) and int(cfg.time_median_win) > 1:
+            beta_f = _median_filter_1d_nan(beta, int(cfg.time_median_win))
+            gamma_f = _median_filter_1d_nan(gamma, int(cfg.time_median_win))
+        else:
+            beta_f = beta.copy()
+            gamma_f = gamma.copy()
+
 
     # interp/extrap NaNs
     beta_out = _interp_extrap_1d_nan(beta_f)
