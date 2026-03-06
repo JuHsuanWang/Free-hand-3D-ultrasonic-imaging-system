@@ -1,0 +1,8 @@
+numpy
+opencv-python
+pyvista
+pyvistaqt
+PyQt5
+matplotlib
+# Optional: faster video decoding
+# decord
