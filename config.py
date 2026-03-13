@@ -16,7 +16,7 @@ class AppConfig:
 
     # Crop settings
     crop_size: int = 100
-    y_spacing: float = 5.3
+    y_spacing: float = 5.4
 
     # Segmentation settings
     bright_low: int = 140     # keep pixels >= bright_low
@@ -59,7 +59,7 @@ class AppConfig:
     enable_gt_plot: bool = True   
     tracker_csv_path: str = "tracker_data_1.csv"
     tracker_port: str = "Port:11"              
-    fh_dy_mm_per_frame: float = 0.1325         
+    fh_dy_mm_per_frame: float = 0.1950         
     gt_plot_filename: str = "gt_compare.png"   
     # -----------------------------------------------
 

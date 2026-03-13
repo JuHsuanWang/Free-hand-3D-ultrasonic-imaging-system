@@ -108,6 +108,13 @@ class SessionState:
     beta_deg: Optional[np.ndarray] = None   # per-frame beta (deg)
     gamma_deg: Optional[np.ndarray] = None  # per-frame gamma (deg)
 
+    # --- Volume measurement ---
+    surface_mesh_px: Optional[object] = None   # display mesh in current pixel-based world
+    surface_mesh_mm: Optional[object] = None   # copied/scaled mesh for volume calculation
+    surface_volume_mm3: Optional[float] = None
+    surface_volume_ml: Optional[float] = None
+    # -------------------------
+
 
 
     def ensure_original_dims(self):

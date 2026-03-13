@@ -6,7 +6,33 @@ from pyvistaqt import QtInteractor
 from core.session import SessionState
 from config import AppConfig
 from gui.visualizer import VisualizerController
+import os
+import subprocess
+from PyQt5.QtWidgets import QFileDialog, QMessageBox
+from core.loader import VideoLoader
 
+class CaptureThread(QtCore.QThread):
+    """
+    Background thread to run the PSRT real-time capture script.
+    This prevents the main GUI from freezing during data acquisition.
+    """
+    finished_signal = QtCore.pyqtSignal(bool, str)
+
+    def run(self):
+        try:
+            # Name of your PSRT script
+            script_name = "PSRT_Python - 茹瑄implementation.py"
+            
+            # Execute the script as a separate process
+            result = subprocess.run(["python", script_name], capture_output=True, text=True)
+            
+            # Check if the process exited successfully
+            if result.returncode == 0:
+                self.finished_signal.emit(True, "Capture successful.")
+            else:
+                self.finished_signal.emit(False, result.stderr)
+        except Exception as e:
+            self.finished_signal.emit(False, str(e))
 
 class MainWindow(QtWidgets.QMainWindow):
     """PyQt main window: embeds PyVista interactor and provides control buttons."""
@@ -16,7 +42,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sess = session
         self.cfg = cfg
 
-        self.setWindowTitle("Video Crop & 3D Visualizer (Modular)")
+        self.setWindowTitle("Freehand 3D US System")
         self.resize(1200, 800)
 
         central = QtWidgets.QWidget()
@@ -55,6 +81,25 @@ class MainWindow(QtWidgets.QMainWindow):
         panel = QtWidgets.QWidget()
         panel_layout = QtWidgets.QVBoxLayout(panel)
         panel_layout.setContentsMargins(10, 10, 10, 10)
+        # --- Data Source Group ---
+        grp_source = QtWidgets.QGroupBox("1. Data Source")
+        l_source = QtWidgets.QVBoxLayout()
+        
+        # Button for offline mode
+        self.btn_load_offline = QtWidgets.QPushButton("Load Offline Videos")
+        self.btn_load_offline.setStyleSheet("background-color: #ADD8E6; padding: 10px; font-weight: bold;")
+        
+        # Button for real-time mode
+        self.btn_live_capture = QtWidgets.QPushButton("Live Capture (PSRT)")
+        self.btn_live_capture.setStyleSheet("background-color: #FFA07A; padding: 10px; font-weight: bold;")
+        
+        l_source.addWidget(self.btn_load_offline)
+        l_source.addWidget(self.btn_live_capture)
+        grp_source.setLayout(l_source)
+        
+        panel_layout.addWidget(grp_source)
+        panel_layout.addSpacing(15)
+        # -------------------------
 
         self.btn_toggle_frames = QtWidgets.QPushButton("Close Frames")
         self.btn_show_y = QtWidgets.QPushButton("Show Y Heatmap")
@@ -145,8 +190,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_yellow_box.toggled.connect(self._on_toggle_yellow_band)
         self.chk_orange_grid.toggled.connect(self._on_toggle_orange_grid)
 
-        # Build initial scene
-        self.ctrl.build_initial_scene()
+        # DO NOT build initial scene at startup, wait for user input
+        # self.ctrl.build_initial_scene()
+
+        # Connect data source buttons
+        self.btn_load_offline.clicked.connect(self._on_load_offline)
+        self.btn_live_capture.clicked.connect(self._on_live_capture)
 
         # --- NEW: Labeling Signals ---
         self.slider_frame.valueChanged.connect(self._on_slider_changed)
@@ -165,6 +214,76 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self._check_processing_done)
         self.timer.start(500)
+
+    def _on_load_offline(self):
+        """
+        Triggered when 'Load Offline Videos' is clicked.
+        Opens file dialogs to select local .avi files.
+        """
+        path_L, _ = QFileDialog.getOpenFileName(self, "Select Left Plane Video (Plane A)", "", "Video Files (*.avi *.mp4)")
+        if not path_L: return
+        
+        path_R, _ = QFileDialog.getOpenFileName(self, "Select Right Plane Video (Plane B)", "", "Video Files (*.avi *.mp4)")
+        if not path_R: return
+
+        self._load_videos_and_start(path_L, path_R)
+
+    def _on_live_capture(self):
+        """
+        Triggered when 'Live Capture' is clicked.
+        Disables buttons and starts the PSRT script in a background thread.
+        """
+        # Disable buttons to prevent multiple clicks
+        self.btn_live_capture.setEnabled(False)
+        self.btn_load_offline.setEnabled(False)
+        self.btn_live_capture.setText("Scanning... Please Wait")
+        self.ctrl.update_status("Connecting to Prodigy and capturing frames...")
+
+        # Start the background thread for PSRT
+        self.capture_thread = CaptureThread()
+        self.capture_thread.finished_signal.connect(self._on_capture_finished)
+        self.capture_thread.start()
+
+    def _on_capture_finished(self, success: bool, message: str):
+        """
+        Callback triggered when the PSRT background thread finishes.
+        """
+        # Re-enable buttons
+        self.btn_live_capture.setEnabled(True)
+        self.btn_load_offline.setEnabled(True)
+        self.btn_live_capture.setText("Live Capture (PSRT)")
+
+        if success:
+            QMessageBox.information(self, "Success", "Live capture finished! Loading data...")
+            # Load the newly created video files generated by recorder.py
+            self._load_videos_and_start("L_s.avi", "R_s.avi")
+        else:
+            QMessageBox.critical(self, "Capture Failed", f"Error communicating with Prodigy:\n{message}")
+            self.ctrl.update_status("Capture failed. Check connection.")
+
+    def _load_videos_and_start(self, left_path: str, right_path: str):
+        """
+        Core function to extract frames from video files and initialize the 3D scene.
+        """
+        if not os.path.exists(left_path) or not os.path.exists(right_path):
+            QMessageBox.warning(self, "Error", "Video files not found!")
+            return
+
+        self.ctrl.update_status("Extracting frames... please wait.")
+        QtWidgets.QApplication.processEvents() # Force UI refresh
+
+        # 1. Extract frames using VideoLoader
+        loader = VideoLoader(output_fps=self.cfg.output_fps)
+        self.sess.left_video_path = left_path
+        self.sess.right_video_path = right_path
+        self.sess.left_frames_original = loader.extract_frames(left_path)
+        self.sess.right_frames_original = loader.extract_frames(right_path)
+        
+        # 2. Ensure dimensions are correctly stored in session
+        self.sess.ensure_original_dims()
+        
+        # 3. Build the initial PyVista scene (Step 1: ROI selection)
+        self.ctrl.build_initial_scene()
 
     def _on_toggle_frames(self):
         self.ctrl.toggle_frames()

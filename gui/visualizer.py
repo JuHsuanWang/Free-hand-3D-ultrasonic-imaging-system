@@ -1313,6 +1313,122 @@ class VisualizerController:
             print(f"Surface reconstruction failed: {e}")
             return None
         
+    def _build_mm_volume_mesh_from_display_mesh(self, mesh_px: pv.PolyData) -> Optional[pv.PolyData]:
+        """
+        Convert the current display mesh (pixel-based world) into a mm-based mesh
+        for reliable volume calculation.
+
+        Current display coordinates:
+            X = pixel
+            Z = pixel
+            Y = frame_idx * cfg.y_spacing
+
+        Target physical coordinates:
+            X_mm = X_px * depth_mm_per_px
+            Z_mm = Z_px * depth_mm_per_px
+            Y_mm = Y_display * (fh_dy_mm_per_frame / cfg.y_spacing)
+        """
+        if mesh_px is None or mesh_px.n_points < 4:
+            return None
+
+        s = self.sess
+        depth_mm_per_px = float(getattr(s, "depth_mm_per_px", 0.0))
+        if depth_mm_per_px <= 0:
+            raise ValueError("depth_mm_per_px is not ready. Please confirm ROI first.")
+
+        y_scale = float(self.cfg.fh_dy_mm_per_frame) / float(self.cfg.y_spacing)
+
+        mesh_mm = mesh_px.copy(deep=True)
+        pts = np.asarray(mesh_mm.points, dtype=np.float64).copy()
+
+        # X, Y, Z -> mm
+        pts[:, 0] *= depth_mm_per_px
+        pts[:, 1] *= y_scale
+        pts[:, 2] *= depth_mm_per_px
+
+        mesh_mm.points = pts.astype(np.float32)
+
+        # clean + triangulate + surface + fill holes
+        try:
+            mesh_mm = mesh_mm.extract_surface()
+        except Exception:
+            pass
+
+        try:
+            mesh_mm = mesh_mm.clean()
+        except Exception:
+            pass
+
+        try:
+            mesh_mm = mesh_mm.triangulate()
+        except Exception:
+            pass
+
+        # Make it closed if possible
+        try:
+            mesh_mm = mesh_mm.fill_holes(1e9)
+        except Exception:
+            pass
+
+        try:
+            mesh_mm = mesh_mm.clean().triangulate()
+        except Exception:
+            pass
+
+        return mesh_mm
+
+
+    def _compute_mesh_volume_mm3(self, mesh_mm: pv.PolyData) -> float:
+        """
+        Compute volume from a mm-based closed mesh.
+        Returns volume in mm^3.
+        """
+        if mesh_mm is None or mesh_mm.n_points < 4:
+            raise ValueError("Mesh is empty.")
+
+        work = mesh_mm.copy(deep=True)
+
+        try:
+            work = work.extract_surface()
+        except Exception:
+            pass
+
+        try:
+            work = work.clean().triangulate()
+        except Exception:
+            pass
+
+        # Try to orient normals consistently
+        try:
+            work = work.compute_normals(
+                cell_normals=True,
+                point_normals=False,
+                auto_orient_normals=True,
+                consistent_normals=True,
+                splitting=False,
+                inplace=False,
+            )
+        except Exception:
+            pass
+
+        n_open_edges = None
+        try:
+            n_open_edges = int(work.n_open_edges)
+        except Exception:
+            pass
+
+        if n_open_edges is not None and n_open_edges > 0:
+            try:
+                work = work.fill_holes(1e9).clean().triangulate()
+            except Exception:
+                pass
+
+        vol = float(work.volume)
+        if not np.isfinite(vol):
+            raise ValueError("Computed volume is not finite.")
+
+        return abs(vol)
+        
     def _hide_all_3d_actors_for_labeling(self):
         # Hide stacked frames + overlays
         for a in getattr(self, "frame_actors", []):
@@ -1829,6 +1945,42 @@ class VisualizerController:
             surf, color="lime", opacity=0.5, smooth_shading=True
         )
 
+        # -----------------------------
+        # NEW: save surface + compute volume
+        # -----------------------------
+        try:
+            self.sess.surface_mesh_px = surf.copy(deep=True)
+
+            mesh_mm = self._build_mm_volume_mesh_from_display_mesh(surf)
+            self.sess.surface_mesh_mm = mesh_mm
+
+            vol_mm3 = self._compute_mesh_volume_mm3(mesh_mm)
+            self.sess.surface_volume_mm3 = vol_mm3
+            self.sess.surface_volume_ml = vol_mm3 / 1000.0
+
+            print(
+                f"[Volume] depth_mm_per_px={self.sess.depth_mm_per_px:.6f} mm/px | "
+                f"y_mm_per_frame={self.cfg.fh_dy_mm_per_frame:.6f} mm/frame | "
+                f"volume={vol_mm3:.3f} mm^3 ({self.sess.surface_volume_ml:.4f} mL)"
+            )
+
+            self.update_status(
+                f"Surface generated from {len(rings)} frames, {M} pts/ring.\n"
+                f"Volume = {vol_mm3:.3f} mm^3 ({self.sess.surface_volume_ml:.4f} mL)\n"
+                f"depth_mm_per_px = {self.sess.depth_mm_per_px:.4f} | "
+                f"y = {self.cfg.fh_dy_mm_per_frame:.4f} mm/frame"
+            )
+        except Exception as e:
+            self.sess.surface_mesh_px = None
+            self.sess.surface_mesh_mm = None
+            self.sess.surface_volume_mm3 = None
+            self.sess.surface_volume_ml = None
+            print(f"[Volume] failed: {e}")
+            self.update_status(
+                "Surface generated, but volume calculation failed.\n"
+                f"Reason: {e}"
+            )
+
         # If you still want a point cloud for debugging, use ring points (already downsampled)
         cloud_pts = P.reshape(-1, 3)
         cloud = pv.PolyData(cloud_pts)
@@ -1839,7 +1991,14 @@ class VisualizerController:
             cloud, color="cyan", point_size=6, render_points_as_spheres=True
         )
         self._surface_built_once = True
-        self.update_status(f"Surface generated from {len(rings)} frames, {M} pts/ring.")
+        if self.sess.surface_volume_mm3 is not None:
+            self.update_status(
+                f"Surface generated from {len(rings)} frames, {M} pts/ring.\n"
+                f"Volume = {self.sess.surface_volume_mm3:.3f} mm^3 "
+                f"({self.sess.surface_volume_ml:.4f} mL)"
+            )
+        else:
+            self.update_status(f"Surface generated from {len(rings)} frames, {M} pts/ring.")
         try:
             self.sess.point_cloud_visible = True
             self._set_actor_visibility(self.point_cloud_actor, True)

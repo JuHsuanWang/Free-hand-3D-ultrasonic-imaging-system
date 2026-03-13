@@ -27,52 +27,27 @@ def _make_run_name(left_path: str, right_path: str) -> str:
 
 
 def main():
-    left_video = "Ln.avi"
-    right_video = "Rn.avi"
-
-    #left_video = "Right_Phantom2_2.avi"
-    #right_video = "Left_Phantom2_2.avi"
-
-    if len(sys.argv) >= 3:
-        left_video = sys.argv[1]
-        right_video = sys.argv[2]
-
-    for v in (left_video, right_video):
-        if not os.path.exists(v):
-            print(f"Error: '{v}' not found")
-            sys.exit(1)
-
     cfg = AppConfig()
 
-    # --- NEW: output/<run_name>/... ---
-    cfg.run_name = _make_run_name(left_video, right_video)
+    # Generate a default run name since no video is loaded yet
+    import datetime
+    cfg.run_name = f"Run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir = os.path.join(cfg.output_root, cfg.run_name)
     os.makedirs(run_dir, exist_ok=True)
 
-    # Put everything under one clean folder
+    # Set output directories
     cfg.png_out_dir = os.path.join(run_dir, "cropped_frames")
     cfg.stabilized_out_dir = os.path.join(run_dir, "stabilized_frames")
-    # (Optional) if later you save pointcloud/surface, put them here too:
-    # cfg.pointcloud_out_dir = os.path.join(run_dir, "pointcloud")
-    # cfg.surface_out_dir = os.path.join(run_dir, "surface")
 
     print(f"[Output] {run_dir}")
 
-    # Load frames (backend I/O)
-    loader = VideoLoader(output_fps=cfg.output_fps)
-    sess = SessionState(left_video_path=left_video, right_video_path=right_video)
+    # Initialize an empty SessionState. Videos will be loaded via GUI.
+    sess = SessionState(left_video_path="", right_video_path="")
 
     print("=" * 50)
-    print("Video Crop & 3D Visualizer (Modular)")
+    print("Freehand 3D US System")
     print("=" * 50)
-
-    print("\nLoading videos...")
-    sess.left_frames_original = loader.extract_frames(left_video)
-    sess.right_frames_original = loader.extract_frames(right_video)
-    sess.ensure_original_dims()
-
-    print(f"Original frame: {sess.orig_frame_w}x{sess.orig_frame_h}")
-    print(f"L: {len(sess.left_frames_original)}, R: {len(sess.right_frames_original)} frames")
+    print("Ready. Waiting for user to select data source...")
 
     # Start Qt
     app = QtWidgets.QApplication(sys.argv)
