@@ -1,4 +1,4 @@
-# Video Crop & 3D Visualizer
+# Free hand 3D ultrasounic imaging system
 
 A PyQt5 + PyVista desktop tool for loading synchronized left/right ultrasound videos, selecting an ROI, choosing a crop center, stabilizing the sequence, visualizing stacked 3D frames, inspecting out-of-plane motion, and manually labeling contours to reconstruct a 3D surface and estimate volume.
 
