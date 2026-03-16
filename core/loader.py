@@ -111,3 +111,62 @@ class VideoLoader:
         cap.release()
         return np.asarray(frames, dtype=np.uint8)
 
+class ImageSequenceLoader:
+    """Load ordered PNG/JPG image sequences from folders into (N,H,W,3) uint8 BGR."""
+
+    def __init__(self, valid_exts=None):
+        if valid_exts is None:
+            valid_exts = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+        self.valid_exts = tuple(ext.lower() for ext in valid_exts)
+
+    def extract_frames_from_folder(self, folder_path: str) -> np.ndarray:
+        if not os.path.isdir(folder_path):
+            raise FileNotFoundError(f"Folder not found: {folder_path}")
+
+        filenames = [
+            f for f in os.listdir(folder_path)
+            if os.path.isfile(os.path.join(folder_path, f))
+            and f.lower().endswith(self.valid_exts)
+        ]
+        filenames = sorted(filenames)
+
+        if len(filenames) == 0:
+            raise ValueError(f"No image files found in folder: {folder_path}")
+
+        frames = []
+        ref_h, ref_w = None, None
+
+        print(f"Loading image sequence from {folder_path}... ({len(filenames)} frames)")
+
+        for fname in filenames:
+            fpath = os.path.join(folder_path, fname)
+            img = cv2.imread(fpath, cv2.IMREAD_UNCHANGED)
+
+            if img is None:
+                raise ValueError(f"Failed to read image: {fpath}")
+
+            # Convert all inputs to BGR uint8
+            if img.ndim == 2:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            elif img.ndim == 3 and img.shape[2] == 4:
+                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            elif img.ndim == 3 and img.shape[2] == 3:
+                pass
+            else:
+                raise ValueError(f"Unsupported image shape {img.shape} for file: {fpath}")
+
+            if img.dtype != np.uint8:
+                img = img.astype(np.uint8)
+
+            h, w = img.shape[:2]
+            if ref_h is None:
+                ref_h, ref_w = h, w
+            elif h != ref_h or w != ref_w:
+                raise ValueError(
+                    f"Image size mismatch in folder {folder_path}. "
+                    f"Expected {(ref_h, ref_w)}, got {(h, w)} for {fname}"
+                )
+
+            frames.append(img)
+
+        return np.asarray(frames, dtype=np.uint8)

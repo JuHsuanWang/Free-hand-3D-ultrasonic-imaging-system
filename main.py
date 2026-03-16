@@ -42,7 +42,7 @@ def main():
     print(f"[Output] {run_dir}")
 
     # Initialize an empty SessionState. Videos will be loaded via GUI.
-    sess = SessionState(left_video_path="", right_video_path="")
+    sess = SessionState()
 
     print("=" * 50)
     print("Freehand 3D US System")

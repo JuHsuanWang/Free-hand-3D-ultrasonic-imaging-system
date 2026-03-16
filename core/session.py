@@ -1,7 +1,7 @@
 # core/session.py
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 import numpy as np
 
 
@@ -9,9 +9,12 @@ import numpy as np
 class SessionState:
     """Stores app state and shared data between backend and GUI."""
 
-    # Paths
-    left_video_path: str
-    right_video_path: str
+    # Input mode / paths
+    input_mode: str = "video"   # "video" | "simulation" | "live"
+    left_video_path: str = ""
+    right_video_path: str = ""
+    left_source_path: str = ""
+    right_source_path: str = ""
 
     # Original frames (BGR)
     left_frames_original: Optional[np.ndarray] = None
