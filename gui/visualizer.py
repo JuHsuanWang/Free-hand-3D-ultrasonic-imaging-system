@@ -782,6 +782,7 @@ class VisualizerController:
 
         self.update_status("Processing...")
         self.plotter.render()
+        transforms = []
 
         # Stabilize full ROI (optional)
         if self.cfg.enable_stabilization:
@@ -933,7 +934,11 @@ class VisualizerController:
 
             except Exception as e:
                 print(f"[GT] Plot/CSV failed: {e}")
-            # -------------------------------
+        # -------------------------------
+        if self.cfg.input_mode == "simulation":
+            self.update_status("Simulation Mode: Running Auto-Labeling...")
+            self.run_auto_labeling_simulation()
+            self.update_status("Auto-Labeling Complete. Press 'Generate 3D' to finish.")
 
         self.plotter.render()
 
@@ -1279,6 +1284,46 @@ class VisualizerController:
     # -------------------------
     # 3D Visualization
     # -------------------------
+    def run_auto_labeling_simulation(self):
+        """
+        Automatically segment simulation frames.
+        Keep ONLY the largest component IF its area > sim_min_area.
+        """
+        s = self.sess
+        n = len(s.right_frames)
+        if n == 0: return
+
+        stride = int(getattr(self, "render_stride", 10))
+        s.manual_contours.clear() 
+
+        for i in range(0, n, stride):
+            frame = s.right_frames[i]
+            # Convert to grayscale
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame.copy()
+
+            # 1. Thresholding: dark pixels (< 50) become target (255)
+            _, binary = cv2.threshold(gray, self.cfg.sim_auto_threshold, 255, cv2.THRESH_BINARY_INV)
+
+            # 2. Connected Components Analysis to find objects
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+            
+            if num_labels <= 1: continue # Only background
+
+            # 3. Filter by area: find max area and check if it exceeds 500
+            areas = stats[1:, cv2.CC_STAT_AREA]
+            max_area = np.max(areas)
+            
+            if max_area > self.cfg.sim_min_area:
+                largest_label = np.argmax(areas) + 1 
+                mask = np.zeros_like(binary)
+                mask[labels == largest_label] = 255
+
+                # 4. Extract contour points for 3D generation
+                cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if cnts:
+                    main_cnt = max(cnts, key=cv2.contourArea)
+                    # Store as (u, v) list
+                    s.manual_contours[i] = [(float(pt[0][0]), float(pt[0][1])) for pt in main_cnt]
 
     def downsample_point_cloud(self, points_xyz: np.ndarray) -> np.ndarray:
         """Downsample point cloud using PyVista clean + random cap."""
@@ -1315,64 +1360,47 @@ class VisualizerController:
         
     def _build_mm_volume_mesh_from_display_mesh(self, mesh_px: pv.PolyData) -> Optional[pv.PolyData]:
         """
-        Convert the current display mesh (pixel-based world) into a mm-based mesh
-        for reliable volume calculation.
-
-        Current display coordinates:
-            X = pixel
-            Z = pixel
-            Y = frame_idx * cfg.y_spacing
-
-        Target physical coordinates:
-            X_mm = X_px * depth_mm_per_px
-            Z_mm = Z_px * depth_mm_per_px
-            Y_mm = Y_display * (fh_dy_mm_per_frame / cfg.y_spacing)
+        Convert display mesh (pixel units) to physical mesh (mm units).
+        - Simulation Mode: Forced 0.1 mm/pixel.
+        - Other Modes: Uses ROI calibration (depth_mm_per_px).
         """
         if mesh_px is None or mesh_px.n_points < 4:
             return None
 
         s = self.sess
-        depth_mm_per_px = float(getattr(s, "depth_mm_per_px", 0.0))
-        if depth_mm_per_px <= 0:
-            raise ValueError("depth_mm_per_px is not ready. Please confirm ROI first.")
+        
+        # --- NEW Logic for Simulation vs Real Video ---
+        if self.cfg.input_mode == "simulation":
+            # Forced 0.1 mm/px as requested
+            depth_mm_per_px = 0.1
+            print("[Volume] Simulation Mode: Using fixed 0.1 mm/px scale.")
+        else:
+            depth_mm_per_px = float(getattr(s, "depth_mm_per_px", 0.0))
+            if depth_mm_per_px <= 0:
+                # Fallback if calibration failed
+                depth_mm_per_px = 0.1 
 
+        # Y scale calculation (display Y units -> actual mm)
+        # Display Y = frame_idx * y_spacing
+        # Target Y = frame_idx * fh_dy_mm_per_frame
         y_scale = float(self.cfg.fh_dy_mm_per_frame) / float(self.cfg.y_spacing)
 
         mesh_mm = mesh_px.copy(deep=True)
         pts = np.asarray(mesh_mm.points, dtype=np.float64).copy()
 
-        # X, Y, Z -> mm
-        pts[:, 0] *= depth_mm_per_px
-        pts[:, 1] *= y_scale
-        pts[:, 2] *= depth_mm_per_px
+        # Apply physical scaling
+        pts[:, 0] *= depth_mm_per_px  # X (mm)
+        pts[:, 1] *= y_scale          # Y (mm)
+        pts[:, 2] *= depth_mm_per_px  # Z (mm)
 
         mesh_mm.points = pts.astype(np.float32)
 
-        # clean + triangulate + surface + fill holes
+        # Basic mesh cleaning to ensure volume can be calculated
         try:
-            mesh_mm = mesh_mm.extract_surface()
-        except Exception:
-            pass
-
-        try:
-            mesh_mm = mesh_mm.clean()
-        except Exception:
-            pass
-
-        try:
-            mesh_mm = mesh_mm.triangulate()
-        except Exception:
-            pass
-
-        # Make it closed if possible
-        try:
-            mesh_mm = mesh_mm.fill_holes(1e9)
-        except Exception:
-            pass
-
-        try:
-            mesh_mm = mesh_mm.clean().triangulate()
-        except Exception:
+            mesh_mm = mesh_mm.extract_surface().clean().triangulate()
+            # Ensure the mesh is closed for volume calculation
+            mesh_mm = mesh_mm.fill_holes(1e9).clean()
+        except:
             pass
 
         return mesh_mm
@@ -1814,64 +1842,52 @@ class VisualizerController:
 
     def generate_surface_from_labels(self):
         """
-        Re-calculates 3D positions from 2D manual labels (applying current beta/gamma)
-        and reconstructs the surface.
+        Re-calculates 3D positions from 2D manual labels and reconstructs the surface.
+        - Automatic Point Alignment: Minimizes twisting between sampled frames.
+        - NO Interpolation: Uses only the frames selected by the user.
         """
-        self.update_status("Generating surface from manual labels...")
+        self.update_status("Generating aligned surface...")
         sorted_indices = sorted(self.sess.manual_contours.keys())
-        rings = []
-        ring_frame_ids = []
-        if not sorted_indices:
-            # If called automatically but no labels exist, just return silently
+        
+        if len(sorted_indices) < 2:
+            self.update_status("Need at least 2 frames to build a surface.")
             return
-        
-        # Cleanup
-        if self.point_cloud_actor:
-            try: self.plotter.remove_actor(self.point_cloud_actor)
-            except Exception: pass
-        if self.surface_actor:
-            try: self.plotter.remove_actor(self.surface_actor)
-            except Exception: pass
 
-        for act in self.existing_label_actors.values():
-            self.plotter.remove_actor(act)
-        self.existing_label_actors.clear()
-
-        # cleanup temp labeling actors too
-        if getattr(self, "temp_label_actor", None):
-            try: self.plotter.remove_actor(self.temp_label_actor)
-            except Exception: pass
-            self.temp_label_actor = None
-
-        if getattr(self, "temp_label_points_actor", None):
-            try: self.plotter.remove_actor(self.temp_label_points_actor)
-            except Exception: pass
-            self.temp_label_points_actor = None
-        
-        def _resample_closed_curve_xyz(pts_xyz: np.ndarray, m: int = 64) -> np.ndarray:
-            """
-            Resample a closed 3D polyline to exactly m points (uniform arc-length).
-            pts_xyz: (N,3) WITHOUT repeating the first point at the end.
-            returns: (m,3) WITHOUT repeating the first point.
-            """
+        # --- Helper 1: Resample a ring to exactly M points ---
+        def _resample_ring(pts_xyz, m=64):
             pts = np.asarray(pts_xyz, dtype=np.float32)
-            if len(pts) < 3:
-                return pts
-
-            # close it (for arc-length)
+            # Ensure the curve is treated as closed for resampling
             closed = np.vstack([pts, pts[0]])
             seg = np.linalg.norm(np.diff(closed, axis=0), axis=1)
             s = np.concatenate([[0.0], np.cumsum(seg)])
-            if s[-1] <= 1e-6:
-                return np.repeat(pts[:1], m, axis=0)
-
-            t = np.linspace(0.0, s[-1], m + 1)[:-1]  # exclude endpoint to avoid duplicate of start
+            if s[-1] <= 1e-6: return np.repeat(pts[:1], m, axis=0)
+            t = np.linspace(0.0, s[-1], m + 1)[:-1]
             out = np.zeros((m, 3), dtype=np.float32)
             for d in range(3):
                 out[:, d] = np.interp(t, s, closed[:, d])
             return out
 
+        # --- Helper 2: Align target_ring to reference_ring by rolling indices ---
+        def _align_ring(target_ring, reference_ring):
+            """Find the best roll index to minimize the distance between rings."""
+            m = len(target_ring)
+            best_roll = 0
+            min_dist_sq = float('inf')
+            
+            # Check every possible shift to find the most parallel alignment
+            for r in range(m):
+                rolled = np.roll(target_ring, r, axis=0)
+                # Sum of squared Euclidean distances
+                dist_sq = np.sum(np.sum((rolled - reference_ring)**2, axis=1))
+                if dist_sq < min_dist_sq:
+                    min_dist_sq = dist_sq
+                    best_roll = r
+            return np.roll(target_ring, best_roll, axis=0)
 
+        # 1. Process and Resample each labeled frame
+        processed_rings = []
+        M = 64 # Number of points per ring
+        
         for idx in sorted_indices:
             pts_2d = self.sess.manual_contours[idx]
             if len(pts_2d) < 3: continue
@@ -1881,131 +1897,71 @@ class VisualizerController:
             beta = self.sess.beta_deg[idx] if (self.sess.beta_deg is not None and idx < len(self.sess.beta_deg)) else 0.0
             gamma = self.sess.gamma_deg[idx] if (self.sess.gamma_deg is not None and idx < len(self.sess.gamma_deg)) else 0.0
 
-            # Convert 2D -> 3D
-            raw_3d = []
+            # 2D ROI -> 3D World
+            pts_3d = []
             for (u, v) in pts_2d:
                 wx, wy, wz = full_img_to_world_3d(u, v, idx, self.sess.frame_h, self.cfg.y_spacing)
-                raw_3d.append([wx, wy, wz])
+                pts_3d.append([wx, wy, wz])
             
-            # Draw Yellow Line
-            loop_pts = np.array(raw_3d + [raw_3d[0]], dtype=np.float32)
-            rot_loop = self._rotate_points_beta_gamma(loop_pts, center, beta, gamma)
-            poly_y = pv.lines_from_points(rot_loop, close=False)
-            act = self.plotter.add_mesh(poly_y, color="yellow", line_width=2)
-            self.existing_label_actors[idx] = act
+            # Apply Beta/Gamma rotation
+            rot_ring = self._rotate_points_beta_gamma(np.array(pts_3d, dtype=np.float32), center, beta, gamma)
+            
+            # Resample to fixed M points
+            resampled = _resample_ring(rot_ring, m=M)
+            processed_rings.append(resampled)
 
-            # --- NEW: resample this ring to fixed M points for lofting ---
-            contour_arr = np.array(raw_3d, dtype=np.float32)          # (N,3) in world (unrotated)
-            rot_ring = self._rotate_points_beta_gamma(contour_arr, center, beta, gamma)  # (N,3)
-            M = 64
-            rot_ring = _resample_closed_curve_xyz(rot_ring, m=M)  # (M,3) no duplicate
-            # --- NEW: align ring start index to avoid twisted/incorrect connectivity ---
-            start_idx = int(np.argmax(rot_ring[:, 0]))  # pick max-x as canonical start
-            rot_ring = np.roll(rot_ring, -start_idx, axis=0)
-
-            rot_ring_closed = np.vstack([rot_ring, rot_ring[0]])    # (M+1,3) close seam
-            rings.append(rot_ring_closed)
-
-
-
-        if len(rings) < 2:
-            self.update_status("Need at least 2 frames to build a surface.")
+        if len(processed_rings) < 2:
             return
 
-        # Stack rings into a StructuredGrid: dims = (M, num_rings, 1)
-        num_rings = len(rings)
-        M = rings[0].shape[0]
+        # 2. Sequential Alignment (The Algorithm)
+        # We keep the first ring as is, and align each subsequent ring to the previous one
+        aligned_rings = [processed_rings[0]]
+        for i in range(1, len(processed_rings)):
+            prev_ring = aligned_rings[i-1]
+            curr_ring = processed_rings[i]
+            aligned_rings.append(_align_ring(curr_ring, prev_ring))
 
-        P = np.stack(rings, axis=1)  # (M, num_rings, 3)
-        X = P[:, :, 0].reshape(M, num_rings, 1)
-        Y = P[:, :, 1].reshape(M, num_rings, 1)
-        Z = P[:, :, 2].reshape(M, num_rings, 1)
+        # 3. Build Mesh using StructuredGrid
+        num_frames = len(aligned_rings)
+        
+        # Combine into a (M, num_frames, 3) array
+        # To make each ring "closed" in the mesh, we add the first point to the end of the data stack
+        stack = np.stack(aligned_rings, axis=1) # (M, N, 3)
+        closed_stack = np.vstack([stack, stack[0:1, :, :]]) # (M+1, N, 3)
+        
+        grid = pv.StructuredGrid(closed_stack[..., 0], closed_stack[..., 1], closed_stack[..., 2])
+        surf = grid.extract_surface().triangulate().clean()
 
-        grid = pv.StructuredGrid(X, Y, Z)
-        surf = grid.extract_surface().triangulate()
-
-        # --- NEW: Cap the open ends using fill_holes ---
-        # Instead of adding geometry (cone), we use a filter to find open edges
-        # (the first and last rings) and patch them with a surface.
+        # 4. Final cap and rendering
         try:
-            # hole_size=1000 is an arbitrary large number to ensure the end caps are filled.
-            surf = surf.fill_holes(100000)
-        except Exception as e:
-            print(f"Warning: Could not fill holes: {e}")
-        # -----------------------------------------------
+            surf = surf.fill_holes(1000).clean()
+        except:
+            pass
 
-        # Render surface
-
-        # Render surface
+        # Cleanup old actors
         if self.surface_actor:
             try: self.plotter.remove_actor(self.surface_actor)
-            except Exception: pass
+            except: pass
 
         self.surface_actor = self.plotter.add_mesh(
             surf, color="lime", opacity=0.5, smooth_shading=True
         )
 
-        # -----------------------------
-        # NEW: save surface + compute volume
-        # -----------------------------
+        # 5. Volume Calculation
         try:
             self.sess.surface_mesh_px = surf.copy(deep=True)
-
             mesh_mm = self._build_mm_volume_mesh_from_display_mesh(surf)
-            self.sess.surface_mesh_mm = mesh_mm
-
             vol_mm3 = self._compute_mesh_volume_mm3(mesh_mm)
             self.sess.surface_volume_mm3 = vol_mm3
             self.sess.surface_volume_ml = vol_mm3 / 1000.0
-
-            print(
-                f"[Volume] depth_mm_per_px={self.sess.depth_mm_per_px:.6f} mm/px | "
-                f"y_mm_per_frame={self.cfg.fh_dy_mm_per_frame:.6f} mm/frame | "
-                f"volume={vol_mm3:.3f} mm^3 ({self.sess.surface_volume_ml:.4f} mL)"
-            )
-
+            
             self.update_status(
-                f"Surface generated from {len(rings)} frames, {M} pts/ring.\n"
-                f"Volume = {vol_mm3:.3f} mm^3 ({self.sess.surface_volume_ml:.4f} mL)\n"
-                f"depth_mm_per_px = {self.sess.depth_mm_per_px:.4f} | "
-                f"y = {self.cfg.fh_dy_mm_per_frame:.4f} mm/frame"
+                f"Surface Aligned. Volume: {vol_mm3:.2f} mm3 ({self.sess.surface_volume_ml:.3f} mL)\n"
+                f"Used {num_frames} frames with {M} aligned pts/ring."
             )
         except Exception as e:
-            self.sess.surface_mesh_px = None
-            self.sess.surface_mesh_mm = None
-            self.sess.surface_volume_mm3 = None
-            self.sess.surface_volume_ml = None
-            print(f"[Volume] failed: {e}")
-            self.update_status(
-                "Surface generated, but volume calculation failed.\n"
-                f"Reason: {e}"
-            )
-
-        # If you still want a point cloud for debugging, use ring points (already downsampled)
-        cloud_pts = P.reshape(-1, 3)
-        cloud = pv.PolyData(cloud_pts)
-        if self.point_cloud_actor:
-            try: self.plotter.remove_actor(self.point_cloud_actor)
-            except Exception: pass
-        self.point_cloud_actor = self.plotter.add_mesh(
-            cloud, color="cyan", point_size=6, render_points_as_spheres=True
-        )
-        self._surface_built_once = True
-        if self.sess.surface_volume_mm3 is not None:
-            self.update_status(
-                f"Surface generated from {len(rings)} frames, {M} pts/ring.\n"
-                f"Volume = {self.sess.surface_volume_mm3:.3f} mm^3 "
-                f"({self.sess.surface_volume_ml:.4f} mL)"
-            )
-        else:
-            self.update_status(f"Surface generated from {len(rings)} frames, {M} pts/ring.")
-        try:
-            self.sess.point_cloud_visible = True
-            self._set_actor_visibility(self.point_cloud_actor, True)
-            self._set_actor_visibility(self.surface_actor, True)
-            self.plotter.reset_camera()
-        except Exception:
-            pass
+            print(f"Volume calculation error: {e}")
+            self.update_status("Surface generated, volume calculation failed.")
 
         self.plotter.render()
 

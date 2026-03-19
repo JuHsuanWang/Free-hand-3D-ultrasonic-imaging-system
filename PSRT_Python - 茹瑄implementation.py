@@ -48,7 +48,7 @@ else:
     print("CuPy is not installed.")
 
 # Import our custom recorder module
-from Core.recorder import DualPlaneRecorder
+from core.recorder import DualPlaneRecorder
 
 # Initialize the recorder, setting the desired output filenames
 my_recorder = DualPlaneRecorder(left_filename="L_s.avi", right_filename="R_s.avi", fps=10)
@@ -221,10 +221,10 @@ is_warning = socket_wait_for_clear_error('Parameter apply is not completed.')
 
 is_prf_modify = Check_PRF(EG_para, Overall_para['EventGroup_num'])
 if (is_prf_modify or is_warning):
-    Result = input(">> Would you like to proceed? (y/n): ").strip().lower()
-    if Result not in ("y", "yes"):
-        print(">> ---------- user interrupt ----------")
-        sys.exit()
+    #Result = input(">> Would you like to proceed? (y/n): ").strip().lower()
+    #if Result not in ("y", "yes"):
+        #print(">> ---------- user interrupt ----------")
+    print(">> [Warning] Parameter warning bypassed automatically for GUI mode.")
 
 Overall_para = update_Overall_para(parametersini_path)
 

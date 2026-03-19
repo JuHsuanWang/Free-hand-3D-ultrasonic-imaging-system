@@ -14,23 +14,55 @@ from core.loader import VideoLoader, ImageSequenceLoader
 class CaptureThread(QtCore.QThread):
     """
     Background thread to run the PSRT real-time capture script.
-    This prevents the main GUI from freezing during data acquisition.
+    Uses Popen to read stdout line-by-line for real-time UI updates.
     """
     finished_signal = QtCore.pyqtSignal(bool, str)
+    # --- Signal to update status text in real-time ---
+    update_signal = QtCore.pyqtSignal(str) 
 
     def run(self):
         try:
             # Name of your PSRT script
             script_name = "PSRT_Python - 茹瑄implementation.py"
             
-            # Execute the script as a separate process
-            result = subprocess.run(["python", script_name], capture_output=True, text=True)
+            # Use Popen with "-u" (unbuffered) to get terminal output instantly
+            process = subprocess.Popen(
+                ["python", "-u", script_name], 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.STDOUT, 
+                text=True, 
+                bufsize=1,
+                encoding='utf-8', 
+                errors='replace'
+            )
             
-            # Check if the process exited successfully
-            if result.returncode == 0:
+            # Initial status
+            self.update_signal.emit("Connecting to Prodigy... Loading parameters.")
+
+            # Read the output line by line as the script runs
+            for line in iter(process.stdout.readline, ''):
+                line = line.strip()
+                if not line: continue
+                
+                # Check keywords in the output to update the GUI status
+                if "read default parameter values" in line:
+                    self.update_signal.emit("Parameters loaded. Applying to Prodigy...")
+                elif "start scan" in line or "One shot mode" in line:
+                    self.update_signal.emit("🟢 CAPTURING NOW! Please move the probe.")
+                elif "scan done" in line:
+                    self.update_signal.emit("Scan finished. Finalizing video files...")
+                
+                # (Optional) Print the background process log to your main console for debugging
+                print(f"[PSRT Log] {line}")
+
+            process.stdout.close()
+            return_code = process.wait()
+
+            if return_code == 0:
                 self.finished_signal.emit(True, "Capture successful.")
             else:
-                self.finished_signal.emit(False, result.stderr)
+                self.finished_signal.emit(False, "Script exited with an error.")
+                
         except Exception as e:
             self.finished_signal.emit(False, str(e))
 
@@ -84,6 +116,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # --- Data Source Group ---
         grp_source = QtWidgets.QGroupBox("1. Data Source")
         l_source = QtWidgets.QVBoxLayout()
+        l_source.setContentsMargins(8, 10, 8, 8)
+        l_source.setSpacing(8)
         
         # Button for offline video mode
         self.btn_load_offline = QtWidgets.QPushButton("Load Offline Videos")
@@ -100,14 +134,18 @@ class MainWindow(QtWidgets.QMainWindow):
         l_source.addWidget(self.btn_load_offline)
         l_source.addWidget(self.btn_load_simulation)
         l_source.addWidget(self.btn_live_capture)
-        
-        l_source.addWidget(self.btn_load_offline)
-        l_source.addWidget(self.btn_live_capture)
+    
         grp_source.setLayout(l_source)
         
         panel_layout.addWidget(grp_source)
         panel_layout.addSpacing(15)
         # -------------------------
+
+                # --- Control Panel Group ---
+        grp_ctrl = QtWidgets.QGroupBox("2. Control Panel")
+        l_ctrl = QtWidgets.QVBoxLayout()
+        l_ctrl.setContentsMargins(8, 10, 8, 8)
+        l_ctrl.setSpacing(8)
 
         self.btn_toggle_frames = QtWidgets.QPushButton("Close Frames")
         self.btn_show_y = QtWidgets.QPushButton("Show Y Heatmap")
@@ -118,12 +156,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_show_y.setFont(btn_font)
         self.btn_show_beta_gamma.setFont(btn_font)
 
-        panel_layout.addWidget(self.btn_toggle_frames)
-        panel_layout.addWidget(self.btn_show_y)
-        panel_layout.addWidget(self.btn_show_beta_gamma)
+        l_ctrl.addWidget(self.btn_toggle_frames)
+        l_ctrl.addWidget(self.btn_show_y)
+        l_ctrl.addWidget(self.btn_show_beta_gamma)
 
-        
-        # overlay checkboxes (bottom)
+        # overlay checkboxes
         self.chk_red_box = QtWidgets.QCheckBox("Show Red Box")
         self.chk_yellow_box = QtWidgets.QCheckBox("Show Yellow Band")
         self.chk_orange_grid = QtWidgets.QCheckBox("Show Orange 3x3 Grid")
@@ -132,13 +169,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_yellow_box.setChecked(True)
         self.chk_orange_grid.setChecked(True)
 
+        l_ctrl.addSpacing(6)
+        l_ctrl.addWidget(self.chk_red_box)
+        l_ctrl.addWidget(self.chk_yellow_box)
+        l_ctrl.addWidget(self.chk_orange_grid)
+
+        grp_ctrl.setLayout(l_ctrl)
+        panel_layout.addWidget(grp_ctrl)
         panel_layout.addSpacing(10)
-        panel_layout.addWidget(self.chk_red_box)
-        panel_layout.addWidget(self.chk_yellow_box)
-        panel_layout.addWidget(self.chk_orange_grid)
 
         # --- NEW: Manual Labeling Control Group ---
-        grp_label = QtWidgets.QGroupBox("Manual Labeling")
+        grp_label = QtWidgets.QGroupBox("3. Manual Labeling")
         l_label = QtWidgets.QVBoxLayout()
 
         # 1. Frame Selection Slider
@@ -270,12 +311,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_load_offline.setEnabled(False)
         self.btn_load_simulation.setEnabled(False)
         self.btn_live_capture.setText("Scanning... Please Wait")
-        self.ctrl.update_status("Connecting to Prodigy and capturing frames...")
-
+        
         # Start the background thread for PSRT
         self.capture_thread = CaptureThread()
         self.capture_thread.finished_signal.connect(self._on_capture_finished)
+        # --- Connect the real-time update signal ---
+        self.capture_thread.update_signal.connect(self._on_capture_status_update) 
         self.capture_thread.start()
+
+    # --- Function to handle real-time status text updates ---
+    def _on_capture_status_update(self, message: str):
+        """
+        Updates the status text on the top-left of the PyVista window in real-time.
+        """
+        self.ctrl.update_status(message)
+        QtWidgets.QApplication.processEvents()  # Force the GUI to refresh immediately
 
     def _on_capture_finished(self, success: bool, message: str):
         """
@@ -288,7 +338,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_live_capture.setText("Live Capture (PSRT)")
 
         if success:
-            QMessageBox.information(self, "Success", "Live capture finished! Loading data...")
+            QMessageBox.information(self, "Success", "Live capture finished!\nClick OK to load data...")
+            
+            self.ctrl.update_status("Loading captured data...")
             self.cfg.apply_mode_settings("live")
             self._load_videos_and_start("L_s.avi", "R_s.avi")
         else:
@@ -417,7 +469,6 @@ class MainWindow(QtWidgets.QMainWindow):
     # --- NEW METHODS FOR MANUAL LABELING ---
 
     def _check_processing_done(self):
-        """Periodically checks if processing is done to enable the frame slider."""
         if self.sess.selection_confirmed and self.sess.right_frames is not None:
             n = len(self.sess.right_frames)
             if n > 0 and self.slider_frame.maximum() != n - 1:
@@ -425,6 +476,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.slider_frame.setEnabled(True)
                 self.slider_frame.setValue(0)
                 self.lbl_frame_idx.setText(f"Frame: 0 / {n-1}")
+                
+                if self.sess.input_mode == "simulation":
+                    self.btn_start_label.setEnabled(False)
+                    self.btn_clear_label.setEnabled(False)
+                    self.btn_start_label.setText("Auto-Labeled")
+                else:
+                    self.btn_start_label.setEnabled(True)
+                    self.btn_clear_label.setEnabled(True)
+
                 self.timer.stop()
 
     def _on_slider_changed(self, val):
