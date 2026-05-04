@@ -89,7 +89,14 @@ class AppConfig:
     dz_mm: float = 0.1
 
     # Stabilization debug
-    save_stab_debug: bool = True
+    save_stab_debug: bool = False
+
+    # When True, detect segmented forward/reverse scan direction.
+    # When False, use the original fixed L(reference) -> R(comparison) series.
+    enable_scan_direction_detection: bool = True
+
+    # Scan direction is allowed to change only at coarse segment boundaries.
+    scan_direction_segment_frames: int = 100
 
     # --- Out-of-plane rotation (beta/gamma) post-processing ---
     enable_beta_gamma_median_filter: bool = False
@@ -98,11 +105,15 @@ class AppConfig:
     crop_top_frac: float = 0.25
     enable_crop_top: bool = True
 
-    # --- Ground-truth (EM tracker) comparison plot ---
-    enable_gt_plot: bool = False
-    tracker_csv_path: str = "tracker_data_1.csv"
-    tracker_port: str = "Port:11"
-    gt_plot_filename: str = "gt_compare.png"
+    # --- Freehand pose export in EM tracker-like CSV format ---
+    enable_tracker_like_export: bool = True
+    tracker_like_export_filename: str = "freehand_tracker_like.csv"
+    tracker_like_port: str = "Port:11"
+
+    # --- Evaluation export (Python -> MATLAB) ---
+    enable_eval_export: bool = True
+    eval_export_stride: int = 10
+    eval_export_filename: str = "pred_eval.mat"
 
     # --------------------------------------------------
     # Helpers

@@ -2,6 +2,7 @@
 import os
 import cv2
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 
 
 class VideoLoader:
@@ -83,18 +84,31 @@ class VideoLoader:
 
         print(f"Loading {video_path}... ({len(indices)} frames)")
 
+        frames = (
+            self._read_dense_sample(cap, indices)
+            if self._should_read_dense(total_frames, len(indices))
+            else self._read_sparse_sample(cap, indices)
+        )
+
+        cap.release()
+        return np.asarray(frames, dtype=np.uint8)
+
+    @staticmethod
+    def _should_read_dense(total_frames: int, sample_count: int) -> bool:
+        if total_frames <= 0:
+            return False
+        return (float(sample_count) / float(total_frames)) >= 0.08
+
+    @staticmethod
+    def _read_sparse_sample(cap: cv2.VideoCapture, indices: np.ndarray) -> list:
         frames = []
         last_pos = -1
-
-        for k, idx in enumerate(indices):
-            # Seek. Some codecs seek to nearest keyframe; still far faster than decoding everything.
+        for idx in indices:
             if idx != last_pos + 1:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
 
             ret, frame = cap.read()
             if not ret:
-                # fallback: sometimes set() is imprecise; try a small forward read
-                # (avoid infinite loop)
                 ok = False
                 for _ in range(3):
                     ret2, frame2 = cap.read()
@@ -106,10 +120,23 @@ class VideoLoader:
                     break
 
             frames.append(frame)
-            last_pos = idx
+            last_pos = int(idx)
+        return frames
 
-        cap.release()
-        return np.asarray(frames, dtype=np.uint8)
+    @staticmethod
+    def _read_dense_sample(cap: cv2.VideoCapture, indices: np.ndarray) -> list:
+        frames = []
+        targets = set(int(v) for v in indices)
+        max_idx = int(indices[-1]) if len(indices) else -1
+        frame_idx = 0
+        while frame_idx <= max_idx:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_idx in targets:
+                frames.append(frame)
+            frame_idx += 1
+        return frames
 
 class ImageSequenceLoader:
     """Load ordered PNG/JPG image sequences from folders into (N,H,W,3) uint8 BGR."""
@@ -133,19 +160,12 @@ class ImageSequenceLoader:
         if len(filenames) == 0:
             raise ValueError(f"No image files found in folder: {folder_path}")
 
-        frames = []
-        ref_h, ref_w = None, None
+        paths = [os.path.join(folder_path, fname) for fname in filenames]
 
-        print(f"Loading image sequence from {folder_path}... ({len(filenames)} frames)")
-
-        for fname in filenames:
-            fpath = os.path.join(folder_path, fname)
+        def _read_one(fpath: str) -> np.ndarray:
             img = cv2.imread(fpath, cv2.IMREAD_UNCHANGED)
-
             if img is None:
                 raise ValueError(f"Failed to read image: {fpath}")
-
-            # Convert all inputs to BGR uint8
             if img.ndim == 2:
                 img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
             elif img.ndim == 3 and img.shape[2] == 4:
@@ -154,10 +174,20 @@ class ImageSequenceLoader:
                 pass
             else:
                 raise ValueError(f"Unsupported image shape {img.shape} for file: {fpath}")
-
             if img.dtype != np.uint8:
                 img = img.astype(np.uint8)
+            return img
 
+        frames = []
+        ref_h, ref_w = None, None
+
+        print(f"Loading image sequence from {folder_path}... ({len(filenames)} frames)")
+
+        workers = min(8, max(1, os.cpu_count() or 1), len(paths))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            loaded = list(ex.map(_read_one, paths))
+
+        for fname, img in zip(filenames, loaded):
             h, w = img.shape[:2]
             if ref_h is None:
                 ref_h, ref_w = h, w

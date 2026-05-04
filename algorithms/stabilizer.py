@@ -90,10 +90,7 @@ def solve_rigid_transform_kabsch(P_px: np.ndarray, Q_px: np.ndarray, dx_mm: floa
     return theta, tx_px, tz_px
 
 
-def warp_back_to_ref(mov: np.ndarray, theta_rad: float, tx_px: float, tz_px: float,
-                     border_mode=cv2.BORDER_CONSTANT):
-    """Apply inverse transform so that mov aligns back to ref coordinate system."""
-    h, w = mov.shape[:2]
+def _inverse_warp_matrix(theta_rad: float, tx_px: float, tz_px: float) -> np.ndarray:
     c = float(np.cos(theta_rad))
     s = float(np.sin(theta_rad))
 
@@ -105,6 +102,11 @@ def warp_back_to_ref(mov: np.ndarray, theta_rad: float, tx_px: float, tz_px: flo
 
     M = np.array([[Rt[0, 0], Rt[0, 1], t_inv[0]],
                   [Rt[1, 0], Rt[1, 1], t_inv[1]]], dtype=np.float32)
+    return M
+
+
+def _warp_with_matrix(mov: np.ndarray, M: np.ndarray, border_mode=cv2.BORDER_CONSTANT):
+    h, w = mov.shape[:2]
 
     channels = mov.shape[2] if mov.ndim > 2 else 1
     if channels == 4:
@@ -118,6 +120,13 @@ def warp_back_to_ref(mov: np.ndarray, theta_rad: float, tx_px: float, tz_px: flo
         borderMode=border_mode,
         borderValue=border_val
     )
+
+
+def warp_back_to_ref(mov: np.ndarray, theta_rad: float, tx_px: float, tz_px: float,
+                     border_mode=cv2.BORDER_CONSTANT):
+    """Apply inverse transform so that mov aligns back to ref coordinate system."""
+    M = _inverse_warp_matrix(theta_rad, tx_px, tz_px)
+    return _warp_with_matrix(mov, M, border_mode=border_mode)
 
 
 def _cc_to_color_bgr(cc: float) -> Tuple[int, int, int]:
@@ -284,15 +293,15 @@ class SequenceStabilizer:
                     P_local.append([lx, lz])
                     Q_local.append([lx + dx, lz + dz])
 
-            transforms.append({
-                "i": int(i),
-                "theta_rad": 0.0,
-                "tx_px": 0.0,
-                "tz_px": 0.0,
-            })
-
             # Not enough correspondences -> skip stabilization for this frame
             if len(P_local) < 6:
+                transforms.append({
+                    "i": int(i),
+                    "theta_rad": 0.0,
+                    "tx_px": 0.0,
+                    "tz_px": 0.0,
+                })
+
                 # still allow debug output (theta/tx/tz = 0), matching third-code behavior
                 if self.cfg.save_debug and self.cfg.debug_out_dir:
                     # Use original mov frame (converted to BGR for drawing)
@@ -342,8 +351,10 @@ class SequenceStabilizer:
                 "tz_px": float(tz),
             })
 
-            right_frames[i] = warp_back_to_ref(right_frames[i], theta, tx, tz)
-            left_frames[i] = warp_back_to_ref(left_frames[i], theta, tx, tz)
+            M = _inverse_warp_matrix(theta, tx, tz)
+            right_frames[i] = _warp_with_matrix(right_frames[i], M)
+            left_frames[i] = _warp_with_matrix(left_frames[i], M)
+            ref_full_gray = _warp_with_matrix(mov_full_gray, M)
 
             # --- NEW: debug image output (EXACT third-code style) ---
             if self.cfg.save_debug and self.cfg.debug_out_dir:
@@ -378,7 +389,6 @@ class SequenceStabilizer:
             # -------------------------------------------------------
 
             # Update reference using stabilized result
-            ref_full_gray = to_gray_u8(right_frames[i])
             ref_crop_gray = ref_full_gray[crop_y1:crop_y1 + self.cfg.crop_size,
                                           crop_x1:crop_x1 + self.cfg.crop_size]
 

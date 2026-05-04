@@ -1,7 +1,9 @@
 # algorithms/out_of_plane.py
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Sequence
+from concurrent.futures import ThreadPoolExecutor
+import os
 
 import numpy as np
 import cv2
@@ -78,132 +80,248 @@ def calculate_optical_flow_similarity_like_matlab_boxfilter_pregrad(
     cfg: OutOfPlaneConfig,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """
-    O(1) LK via boxFilter:
-    Replaces per-point window slicing + building A/b with precomputed window sums.
+    O(1) LK via boxFilter – fully vectorized (no Python loop over grid points).
 
-    Keeps the SAME logic as MATLAB-like version:
-      - det(AtA) < det_thresh -> skip
-      - v = (AtA) \ (Atb)
-      - displacement <= max_displacement -> valid
-      - residual = ||A v + b|| / len(b), local_sim = exp(-residual)
-      - similarity_score = mean(local_sim) over valid points
-
-    Notes:
-      - b = -It, It = img2 - img1
-      - AtA = [[sum Ix^2, sum IxIy],
-               [sum IxIy,  sum Iy^2]]
-      - Atb = A^T b = [-sum Ix It, -sum Iy It]
-      - SSE = ||A v + b||^2 = v^T AtA v + 2 v^T Atb + (b^T b)
-        where b^T b = sum(It^2)
+    Same math / boundary rules as the original MATLAB-like version:
+      - det(AtA) < det_thresh  → skip
+      - v = (AtA)⁻¹ Atb
+      - |v| > max_displacement → skip
+      - similarity = mean(exp(-residual)) over valid points
     """
     img1 = img1.astype(np.float64, copy=False)
     img2 = img2.astype(np.float64, copy=False)
-    Ix = Ix.astype(np.float64, copy=False)
-    Iy = Iy.astype(np.float64, copy=False)
+    Ix   = Ix.astype(np.float64, copy=False)
+    Iy   = Iy.astype(np.float64, copy=False)
 
     It = (img2 - img1).astype(np.float64, copy=False)
-
     h, w = img1.shape
     n = points_xy.shape[0]
 
     flow_vectors = np.zeros((n, 2), dtype=np.float64)
-    valid_mask = np.zeros((n,), dtype=bool)
-    disp_mag = np.zeros((n,), dtype=np.float64)
+    valid_mask   = np.zeros(n, dtype=bool)
+    disp_mag     = np.zeros(n, dtype=np.float64)
 
-    win = int(cfg.window_size)
+    win  = int(cfg.window_size)
     half = win // 2
-    area = float(win * win)  # len(b) in MATLAB-like code
-
-    # Use OpenCV boxFilter (C++ optimized) to compute window sums for entire image.
-    # ddepth=cv2.CV_64F ensures stable numeric parity with float64 math.
-    ksize = (win, win)
+    area = float(win * win)
+    ksize  = (win, win)
     border = cv2.BORDER_CONSTANT
 
-    Ix2 = Ix * Ix
-    Iy2 = Iy * Iy
-    Ixy = Ix * Iy
-    Ixt = Ix * It
-    Iyt = Iy * It
-    It2 = It * It
+    # --- 6 box-filter maps (3 ref-only + 3 pair-specific) ---
+    Sxx = cv2.boxFilter(Ix * Ix, cv2.CV_64F, ksize, normalize=False, borderType=border)
+    Syy = cv2.boxFilter(Iy * Iy, cv2.CV_64F, ksize, normalize=False, borderType=border)
+    Sxy = cv2.boxFilter(Ix * Iy, cv2.CV_64F, ksize, normalize=False, borderType=border)
+    Sxt = cv2.boxFilter(Ix * It, cv2.CV_64F, ksize, normalize=False, borderType=border)
+    Syt = cv2.boxFilter(Iy * It, cv2.CV_64F, ksize, normalize=False, borderType=border)
+    Stt = cv2.boxFilter(It * It, cv2.CV_64F, ksize, normalize=False, borderType=border)
 
-    Sxx = cv2.boxFilter(Ix2, ddepth=cv2.CV_64F, ksize=ksize, normalize=False, borderType=border)
-    Syy = cv2.boxFilter(Iy2, ddepth=cv2.CV_64F, ksize=ksize, normalize=False, borderType=border)
-    Sxy = cv2.boxFilter(Ixy, ddepth=cv2.CV_64F, ksize=ksize, normalize=False, borderType=border)
-    Sxt = cv2.boxFilter(Ixt, ddepth=cv2.CV_64F, ksize=ksize, normalize=False, borderType=border)
-    Syt = cv2.boxFilter(Iyt, ddepth=cv2.CV_64F, ksize=ksize, normalize=False, borderType=border)
-    Stt = cv2.boxFilter(It2, ddepth=cv2.CV_64F, ksize=ksize, normalize=False, borderType=border)
+    # --- vectorized boundary filter ---
+    xs = points_xy[:, 0].astype(np.int32)
+    ys = points_xy[:, 1].astype(np.int32)
+    inb = (xs - half >= 0) & (ys - half >= 0) & (xs + half < w) & (ys + half < h)
+    if not np.any(inb):
+        return flow_vectors, valid_mask, disp_mag, float("nan")
 
-    local_sims: List[float] = []
+    xi = xs[inb];  yi = ys[inb]
 
-    for i in range(n):
-        x = int(points_xy[i, 0])
-        y = int(points_xy[i, 1])
+    sxx = Sxx[yi, xi];  syy = Syy[yi, xi];  sxy = Sxy[yi, xi]
+    sxt = Sxt[yi, xi];  syt = Syt[yi, xi];  stt = Stt[yi, xi]
 
-        # Match original boundary behavior: require FULL window inside image.
-        if (x - half) < 0 or (y - half) < 0 or (x + half) >= w or (y + half) >= h:
-            continue
+    det  = sxx * syy - sxy * sxy
+    good = det >= float(cfg.det_thresh)
 
-        sxx = float(Sxx[y, x])
-        syy = float(Syy[y, x])
-        sxy = float(Sxy[y, x])
-        sxt = float(Sxt[y, x])
-        syt = float(Syt[y, x])
-        stt = float(Stt[y, x])
+    bx = -sxt;  by = -syt
+    ds = np.where(good, det, 1.0)          # safe divisor
+    vx = np.where(good, (syy * bx - sxy * by) / ds,  0.0)
+    vy = np.where(good, (-sxy * bx + sxx * by) / ds, 0.0)
 
-        # det(AtA)
-        det = sxx * syy - sxy * sxy
-        if det < cfg.det_thresh:
-            continue
+    disp = np.hypot(vx, vy)
+    good2 = good & (disp <= float(cfg.max_displacement))
 
-        # Atb = [-sum(Ix*It), -sum(Iy*It)] = [-sxt, -syt]
-        # Solve 2x2 analytically to avoid np.linalg.solve overhead
-        bx = -sxt
-        by = -syt
+    # SSE → local similarity
+    vAtAv = vx * (sxx * vx + sxy * vy) + vy * (sxy * vx + syy * vy)
+    vAtb  = vx * bx + vy * by
+    sse   = np.maximum(vAtAv + 2.0 * vAtb + stt, 0.0)
+    local_sim = np.exp(-np.sqrt(sse) / area)
 
-        vx = ( syy * bx - sxy * by) / det
-        vy = (-sxy * bx + sxx * by) / det
+    # scatter results back into full-length arrays
+    inb_idx = np.where(inb)[0]
+    valid_idx = inb_idx[good2]
+    flow_vectors[valid_idx, 0] = vx[good2]
+    flow_vectors[valid_idx, 1] = vy[good2]
+    disp_mag[valid_idx]        = disp[good2]
+    valid_mask[valid_idx]      = True
 
-        displacement = float(np.hypot(vx, vy))
-        if displacement > cfg.max_displacement:
-            continue
-
-        flow_vectors[i, 0] = vx
-        flow_vectors[i, 1] = vy
-        disp_mag[i] = displacement
-        valid_mask[i] = True
-
-        # SSE = v^T AtA v + 2 v^T Atb + b^T b
-        # where Atb = [bx, by] and b^T b = sum(It^2) = stt
-        vAtAv = (vx * (sxx * vx + sxy * vy) + vy * (sxy * vx + syy * vy))
-        vAtb = (vx * bx + vy * by)
-        sse = vAtAv + 2.0 * vAtb + stt
-
-        # Guard small negatives due to numeric rounding
-        if sse < 0.0:
-            sse = 0.0
-
-        residual = float(np.sqrt(sse) / area)
-        local_sims.append(float(np.exp(-residual)))
-
-    similarity_score = float(np.mean(local_sims)) if len(local_sims) > 0 else float("nan")
+    similarity_score = float(np.mean(local_sim[good2])) if np.any(good2) else float("nan")
     return flow_vectors, valid_mask, disp_mag, similarity_score
+
+
+# ---------------------------------------------------------------------------
+# Fast-path helpers for heatmap computation
+# ---------------------------------------------------------------------------
+
+def _precompute_ref_maps(
+    Ix: np.ndarray, Iy: np.ndarray, win: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute Sxx, Syy, Sxy (the AtA box-filter maps) for ONE reference frame.
+    These only depend on the reference image, so they can be cached and reused
+    for every comparison frame – saving 3 boxFilter calls per pair.
+    """
+    ksize = (win, win)
+    b = cv2.BORDER_CONSTANT
+    Sxx = cv2.boxFilter(Ix * Ix, cv2.CV_64F, ksize, normalize=False, borderType=b)
+    Syy = cv2.boxFilter(Iy * Iy, cv2.CV_64F, ksize, normalize=False, borderType=b)
+    Sxy = cv2.boxFilter(Ix * Iy, cv2.CV_64F, ksize, normalize=False, borderType=b)
+    return Sxx, Syy, Sxy
+
+
+def _lk_mean_disp_fast(
+    ref_norm: np.ndarray,
+    cur_norm: np.ndarray,
+    Ix: np.ndarray,
+    Iy: np.ndarray,
+    Sxx: np.ndarray,
+    Syy: np.ndarray,
+    Sxy: np.ndarray,
+    pts_x: np.ndarray,
+    pts_y: np.ndarray,
+    win: int,
+    det_thresh: float,
+    max_displacement: float,
+) -> float:
+    """
+    Vectorized mean LK displacement at pre-filtered grid points.
+
+    Sxx/Syy/Sxy are precomputed for the reference frame (cached by caller).
+    Only the pair-specific maps Sxt, Syt are computed here (2 boxFilters instead of 6).
+    Grid point sampling is fully vectorized – no Python loop.
+    """
+    It = cur_norm - ref_norm
+    ksize = (win, win)
+    b = cv2.BORDER_CONSTANT
+    Sxt = cv2.boxFilter(Ix * It, cv2.CV_64F, ksize, normalize=False, borderType=b)
+    Syt = cv2.boxFilter(Iy * It, cv2.CV_64F, ksize, normalize=False, borderType=b)
+
+    sxx = Sxx[pts_y, pts_x];  syy = Syy[pts_y, pts_x];  sxy = Sxy[pts_y, pts_x]
+    bx  = -Sxt[pts_y, pts_x]; by  = -Syt[pts_y, pts_x]
+
+    det  = sxx * syy - sxy * sxy
+    good = det >= det_thresh
+    if not np.any(good):
+        return float("nan")
+
+    ds = np.where(good, det, 1.0)
+    vx = np.where(good, (syy * bx - sxy * by) / ds,  0.0)
+    vy = np.where(good, (-sxy * bx + sxx * by) / ds, 0.0)
+
+    disp  = np.hypot(vx, vy)
+    valid = good & (disp <= max_displacement)
+    return float(np.mean(disp[valid])) if np.any(valid) else float("nan")
+
+def _normalize_frame_sequence(
+    frames: np.ndarray,
+    cfg: OutOfPlaneConfig,
+) -> List[np.ndarray]:
+    return [normalize_image_like_matlab(_to_gray_u8(frames[i]), cfg) for i in range(int(len(frames)))]
+
+
+def _compute_lr_heatmap_from_precomputed(
+    ref_norm: Sequence[np.ndarray],
+    cmp_norm: Sequence[np.ndarray],
+    cfg: OutOfPlaneConfig,
+    max_r_ahead: int,
+    frame_stride: int,
+) -> Tuple[np.ndarray, List[Tuple[int, int, float]]]:
+    n_ref = int(len(ref_norm))
+    n_cmp = int(len(cmp_norm))
+    if n_ref == 0 or n_cmp == 0:
+        return np.zeros((0, 0), dtype=np.float32), []
+
+    h, w = ref_norm[0].shape
+    xs = np.arange(cfg.grid_spacing, w - cfg.grid_spacing + 1, cfg.grid_spacing)
+    ys = np.arange(cfg.grid_spacing, h - cfg.grid_spacing + 1, cfg.grid_spacing)
+    Xg, Yg = np.meshgrid(xs, ys)
+    all_pts = np.column_stack([Xg.reshape(-1), Yg.reshape(-1)]).astype(np.int32)
+
+    half = int(cfg.window_size) // 2
+    inb = ((all_pts[:, 0] - half >= 0) & (all_pts[:, 1] - half >= 0) &
+           (all_pts[:, 0] + half < w)  & (all_pts[:, 1] + half < h))
+    pts_x = all_pts[inb, 0].astype(np.int32)
+    pts_y = all_pts[inb, 1].astype(np.int32)
+
+    H = np.full((n_ref, n_cmp), np.nan, dtype=np.float32)
+    if len(pts_x) == 0:
+        return H, []
+
+    ref_grads = []
+    for i in range(n_ref):
+        Iy, Ix = np.gradient(ref_norm[i])
+        ref_grads.append((Ix, Iy))
+
+    win = int(cfg.window_size)
+    det_thresh = float(cfg.det_thresh)
+    max_disp = float(cfg.max_displacement)
+    stride = max(1, int(frame_stride))
+    rows = list(range(0, n_ref, stride))
+
+    def _compute_row(l: int) -> Tuple[int, np.ndarray]:
+        row = np.full((n_cmp,), np.nan, dtype=np.float32)
+        Ix, Iy = ref_grads[l]
+        Sxx, Syy, Sxy = _precompute_ref_maps(Ix, Iy, win)
+        ref = ref_norm[l]
+        r_end = min(l + 1 + max_r_ahead, n_cmp)
+        for r in range(l + 1, r_end):
+            row[r] = _lk_mean_disp_fast(
+                ref, cmp_norm[r], Ix, Iy,
+                Sxx, Syy, Sxy,
+                pts_x, pts_y,
+                win, det_thresh, max_disp,
+            )
+        return l, row
+
+    if len(rows) > 1:
+        max_workers = min(len(rows), max(1, int(os.cpu_count() or 1)))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            for l, row in ex.map(_compute_row, rows):
+                H[l, :] = row
+    else:
+        for l in rows:
+            _, row = _compute_row(l)
+            H[l, :] = row
+
+    best: List[Tuple[int, int, float]] = []
+    for l in rows:
+        row = H[l, :].copy()
+        row[: min(l + 1, n_cmp)] = np.nan
+        if not np.any(np.isfinite(row)):
+            continue
+        r_idx = int(np.nanargmin(row))
+        best.append((l, r_idx, float(H[l, r_idx])))
+
+    return H, best
+
 
 def compute_lr_heatmap_like_matlab(
     cropped_left: np.ndarray,
     cropped_right: np.ndarray,
     cfg: Optional[OutOfPlaneConfig] = None,
+    max_r_ahead: int = 100,
+    frame_stride: int = 1,
 ) -> Tuple[np.ndarray, List[Tuple[int, int, float]]]:
     """
-    MATLAB heatmap loop:
-      for l_idx = 1..num_left
-        reference_img = all_left_images{l_idx}
-        for r_idx = (l_idx + 1)..num_right
-          [~, valid_mask, disp_mag, ~] = calculateOpticalFlowSimilarity(...)
-          if any(valid) heat(l,r)=mean(disp_mag(valid)) else NaN
+    Optimised MATLAB-style heatmap:
+      H[l, r] = mean LK displacement(left_l → right_r)  for r in [l+1, l+max_r_ahead)
+
+    Speed improvements over the original:
+      • Sxx/Syy/Sxy (AtA maps) cached once per reference frame  → 3 fewer boxFilters/pair
+      • Grid-point sampling fully vectorised  → no Python loop per pair
+      • Boundary check done once at startup
+      • Optional frame_stride to compute every Nth reference frame (coarser but faster)
 
     Returns:
-      H (nL,nR) with NaN outside computed region
-      best list: (l_idx, best_r_idx, min_val) using r>=l+1 only
+      H (nL, nR) float32, NaN for uncomputed cells
+      best: [(l, best_r, min_val), ...] – one entry per reference frame
     """
     if cfg is None:
         cfg = OutOfPlaneConfig()
@@ -216,64 +334,93 @@ def compute_lr_heatmap_like_matlab(
     if nL == 0 or nR == 0:
         return np.zeros((0, 0), dtype=np.float32), []
 
-    # build grid points exactly like MATLAB:
-    # X_grid = grid_spacing:grid_spacing:(w-grid_spacing)
-    # Y_grid = grid_spacing:grid_spacing:(h-grid_spacing)
-    ref0 = _to_gray_u8(cropped_left[0])
-    h, w = ref0.shape
-    xs = np.arange(cfg.grid_spacing, w - cfg.grid_spacing + 1, cfg.grid_spacing)
-    ys = np.arange(cfg.grid_spacing, h - cfg.grid_spacing + 1, cfg.grid_spacing)
-    Xg, Yg = np.meshgrid(xs, ys)
-    grid_points = np.column_stack([Xg.reshape(-1), Yg.reshape(-1)]).astype(np.int32)
+    left_norm = _normalize_frame_sequence(cropped_left, cfg)
+    right_norm = _normalize_frame_sequence(cropped_right, cfg)
+    return _compute_lr_heatmap_from_precomputed(
+        left_norm, right_norm, cfg,
+        max_r_ahead=max_r_ahead,
+        frame_stride=frame_stride,
+    )
 
-    H = np.full((nL, nR), np.nan, dtype=np.float32)
 
-    # pre-normalize all frames (exactly matching MATLAB normalizeImage)
-    left_norm = []
-    for i in range(nL):
-        g = _to_gray_u8(cropped_left[i])
-        left_norm.append(normalize_image_like_matlab(g, cfg))
+def _compute_r2_from_best_pairs(best: List[Tuple[int, int, float]]) -> float:
+    """Compute R² of a robust linear regression through best-pair (ref, cmp) coordinates."""
+    if len(best) < 3:
+        return float("nan")
+    xs = np.array([p[0] for p in best], dtype=np.float64)
+    ys = np.array([p[1] for p in best], dtype=np.float64)
+    if len(xs) >= 5:
+        a0, b0 = np.polyfit(xs, ys, 1)
+        res = ys - (a0 * xs + b0)
+        med = np.median(res)
+        mad = float(np.median(np.abs(res - med))) + 1e-6
+        inl = np.abs(res - med) < 2.0 * mad
+        if np.sum(inl) >= 3:
+            xs, ys = xs[inl], ys[inl]
+    a, b = np.polyfit(xs, ys, 1)
+    y_fit = a * xs + b
+    ss_res = float(np.sum((ys - y_fit) ** 2))
+    ss_tot = float(np.sum((ys - float(np.mean(ys))) ** 2))
+    if ss_tot < 1e-12:
+        return float("nan")
+    return float(1.0 - ss_res / ss_tot)
 
-    right_norm = []
-    for j in range(nR):
-        g = _to_gray_u8(cropped_right[j])
-        right_norm.append(normalize_image_like_matlab(g, cfg))
 
-    # --- Precompute gradients for each left frame once (major speedup) ---
-    left_grads = []
-    for i in range(nL):
-        Iy, Ix = np.gradient(left_norm[i])  # note: np.gradient returns (dy, dx)
-        left_grads.append((Ix, Iy))
+def compute_scan_direction_heatmaps(
+    cropped_left: np.ndarray,
+    cropped_right: np.ndarray,
+    cfg: Optional[OutOfPlaneConfig] = None,
+    max_r_ahead: int = 100,
+    frame_stride: int = 1,
+) -> Tuple[str, np.ndarray, List, np.ndarray, List, float, float]:
+    """
+    Compute both forward (L→R) and reverse (R→L) heatmaps and auto-detect scan direction.
 
-    max_r_ahead = 50
-    for l in range(nL):
-        ref = left_norm[l]
-        r_start = l + 1
-        r_end = min(l + 1 + max_r_ahead, nR)  # Python range end is exclusive
-        # MATLAB: r starts from l+1 (L0->R1.., L1->R2..)
-        for r in range(r_start, r_end):
-            cur = right_norm[r]
-            Ix, Iy = left_grads[l]
-            _, valid_mask, disp_mag, _ = calculate_optical_flow_similarity_like_matlab_boxfilter_pregrad(
-                ref, cur, Ix, Iy, grid_points, cfg
-            )
+    Forward: left frames as reference, right frames as comparison (r >= l+1).
+    Reverse: right frames as reference, left frames as comparison (r >= l+1).
 
-            if np.any(valid_mask):
-                H[l, r] = float(np.mean(disp_mag[valid_mask]))
-            else:
-                H[l, r] = np.nan
+    The direction whose best-pair regression yields a higher R² is selected.
 
-    # red dots: per column (l) take minimal value over r>=l+1
-    best: List[Tuple[int, int, float]] = []
-    for l in range(nL):
-        row = H[l, :].copy()
-        row[: min(l + 1, nR)] = np.nan  # enforce r>=l+1
-        if not np.any(np.isfinite(row)):
-            continue
-        r_idx = int(np.nanargmin(row))
-        best.append((l, r_idx, float(H[l, r_idx])))
+    Returns:
+        direction   : "forward" or "reverse"
+        H_fwd       : (nL, nR) forward heatmap
+        best_fwd    : forward best pairs [(l, r, val), ...]
+        H_rev       : (nR, nL) reverse heatmap
+        best_rev    : reverse best pairs [(r, l, val), ...]
+        r2_fwd      : R² of forward regression
+        r2_rev      : R² of reverse regression
+    """
+    if cfg is None:
+        cfg = OutOfPlaneConfig()
 
-    return H, best
+    left_norm = _normalize_frame_sequence(cropped_left, cfg)
+    right_norm = _normalize_frame_sequence(cropped_right, cfg)
+
+    H_fwd, best_fwd = _compute_lr_heatmap_from_precomputed(
+        left_norm, right_norm, cfg,
+        max_r_ahead=max_r_ahead,
+        frame_stride=frame_stride,
+    )
+    H_rev, best_rev = _compute_lr_heatmap_from_precomputed(
+        right_norm, left_norm, cfg,
+        max_r_ahead=max_r_ahead,
+        frame_stride=frame_stride,
+    )
+
+    r2_fwd = _compute_r2_from_best_pairs(best_fwd)
+    r2_rev = _compute_r2_from_best_pairs(best_rev)
+
+    print(f"[ScanDir] R2_fwd={r2_fwd:.3f}, R2_rev={r2_rev:.3f}")
+
+    if np.isnan(r2_fwd) and np.isnan(r2_rev):
+        direction = "forward"
+    elif np.isnan(r2_rev) or (not np.isnan(r2_fwd) and r2_fwd >= r2_rev):
+        direction = "forward"
+    else:
+        direction = "reverse"
+
+    print(f"[ScanDir] Detected: {direction}")
+    return direction, H_fwd, best_fwd, H_rev, best_rev, r2_fwd, r2_rev
 
 # ============================================================
 # Out-of-plane rotation (beta/gamma) from 3x3 grid (exclude center)
@@ -435,6 +582,65 @@ def _patch_flow_median(
     return vx, vy, float(np.mean(valid_mask))
 
 
+def _patch_ref_cache(
+    img1_gray: np.ndarray,
+    cfg: OutOfPlaneRotConfig,
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    h, w = img1_gray.shape
+    xs = np.arange(cfg.grid_spacing, w - cfg.grid_spacing + 1, cfg.grid_spacing)
+    ys = np.arange(cfg.grid_spacing, h - cfg.grid_spacing + 1, cfg.grid_spacing)
+    if xs.size == 0 or ys.size == 0:
+        return None
+
+    Xg, Yg = np.meshgrid(xs, ys)
+    all_pts = np.column_stack([Xg.reshape(-1), Yg.reshape(-1)]).astype(np.int32)
+
+    half = int(cfg.window_size) // 2
+    inb = ((all_pts[:, 0] - half >= 0) & (all_pts[:, 1] - half >= 0) &
+           (all_pts[:, 0] + half < w) & (all_pts[:, 1] + half < h))
+    pts_x = all_pts[inb, 0].astype(np.int32)
+    pts_y = all_pts[inb, 1].astype(np.int32)
+    if pts_x.size == 0:
+        return None
+
+    Iy, Ix = np.gradient(img1_gray)
+    Sxx, Syy, Sxy = _precompute_ref_maps(Ix, Iy, int(cfg.window_size))
+    return Ix, Iy, Sxx, Syy, Sxy, pts_x, pts_y
+
+
+def _patch_flow_median_from_cache(
+    img1_gray: np.ndarray,
+    img2_gray: np.ndarray,
+    cache: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    cfg: OutOfPlaneRotConfig,
+) -> Tuple[float, float, float]:
+    Ix, Iy, Sxx, Syy, Sxy, pts_x, pts_y = cache
+    It = img2_gray - img1_gray
+    ksize = (int(cfg.window_size), int(cfg.window_size))
+    b = cv2.BORDER_CONSTANT
+    Sxt = cv2.boxFilter(Ix * It, cv2.CV_64F, ksize, normalize=False, borderType=b)
+    Syt = cv2.boxFilter(Iy * It, cv2.CV_64F, ksize, normalize=False, borderType=b)
+
+    sxx = Sxx[pts_y, pts_x]; syy = Syy[pts_y, pts_x]; sxy = Sxy[pts_y, pts_x]
+    bx = -Sxt[pts_y, pts_x]; by = -Syt[pts_y, pts_x]
+
+    det = sxx * syy - sxy * sxy
+    good = det >= float(cfg.det_thresh)
+    if not np.any(good):
+        return np.nan, np.nan, 0.0
+
+    ds = np.where(good, det, 1.0)
+    vx = np.where(good, (syy * bx - sxy * by) / ds, 0.0)
+    vy = np.where(good, (-sxy * bx + sxx * by) / ds, 0.0)
+
+    disp = np.hypot(vx, vy)
+    valid = good & (disp <= float(cfg.max_displacement))
+    if not np.any(valid):
+        return np.nan, np.nan, 0.0
+
+    return float(np.median(vx[valid])), float(np.median(vy[valid])), float(np.mean(valid))
+
+
 def _fit_affine_from_patch_flows(pos: np.ndarray, d: np.ndarray) -> Optional[np.ndarray]:
     """
     Fit d = A @ pos + t , where pos=(N,2), d=(N,2).
@@ -505,31 +711,42 @@ def compute_beta_gamma_from_right_grid(
 
     beta = np.full((n,), np.nan, dtype=np.float64)
     gamma = np.full((n,), np.nan, dtype=np.float64)
+    gray_frames = [_to_gray_float64(right_frames[i], cfg) for i in range(n)]
 
     for i in range(n):
         betas_k = []
         gammas_k = []
 
-        img1 = _to_gray_float64(right_frames[i], cfg)
+        img1 = gray_frames[i]
+        patch_cache = {}
+        for offset in offsets:
+            dx, dy = offset
+            p1 = _extract_patch(img1, cx0 + dx, cy0 + dy, cell)
+            if p1 is None:
+                continue
+            cache = _patch_ref_cache(p1, cfg)
+            if cache is not None:
+                patch_cache[offset] = (p1, cache)
 
         for k in range(1, int(cfg.lookahead) + 1):
             j = i + k
             if j >= n:
                 break
-            img2 = _to_gray_float64(right_frames[j], cfg)
+            img2 = gray_frames[j]
 
             pos_list = []
             d_list = []
 
             for (dx, dy) in offsets:
-                pcx = cx0 + dx
-                pcy = cy0 + dy
-                p1 = _extract_patch(img1, pcx, pcy, cell)
-                p2 = _extract_patch(img2, pcx, pcy, cell)
-                if p1 is None or p2 is None:
+                cached = patch_cache.get((dx, dy))
+                if cached is None:
+                    continue
+                p1, cache = cached
+                p2 = _extract_patch(img2, cx0 + dx, cy0 + dy, cell)
+                if p2 is None:
                     continue
 
-                vx, vy, _ = _patch_flow_median(p1, p2, cfg)
+                vx, vy, _ = _patch_flow_median_from_cache(p1, p2, cache, cfg)
                 if not np.isfinite(vx) or not np.isfinite(vy):
                     continue
 

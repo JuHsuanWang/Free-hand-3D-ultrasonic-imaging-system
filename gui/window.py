@@ -7,7 +7,10 @@ from core.session import SessionState
 from config import AppConfig
 from gui.visualizer import VisualizerController
 import os
+import re
 import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from PyQt5.QtWidgets import QFileDialog, QMessageBox
 from core.loader import VideoLoader, ImageSequenceLoader
 
@@ -24,10 +27,19 @@ class CaptureThread(QtCore.QThread):
         try:
             # Name of your PSRT script
             script_name = "PSRT_Python - 茹瑄implementation.py"
-            
+
+            if not os.path.exists(script_name):
+                script_name = next(
+                    (
+                        f for f in os.listdir(".")
+                        if f.startswith("PSRT_Python") and f.endswith("implementation.py")
+                    ),
+                    script_name,
+                )
+
             # Use Popen with "-u" (unbuffered) to get terminal output instantly
             process = subprocess.Popen(
-                ["python", "-u", script_name], 
+                [sys.executable, "-u", script_name],
                 stdout=subprocess.PIPE, 
                 stderr=subprocess.STDOUT, 
                 text=True, 
@@ -51,6 +63,17 @@ class CaptureThread(QtCore.QThread):
                     self.update_signal.emit("🟢 CAPTURING NOW! Please move the probe.")
                 elif "scan done" in line:
                     self.update_signal.emit("Scan finished. Finalizing video files...")
+                else:
+                    m = re.search(r"Frame#\s*(\d+)", line)
+                    if m:
+                        frame_idx = int(m.group(1))
+                        seg_idx = max(1, (frame_idx - 1) // 100 + 1)
+                        seg_start = (seg_idx - 1) * 100 + 1
+                        seg_end = seg_idx * 100
+                        self.update_signal.emit(
+                            f"CAPTURING NOW: Frame {frame_idx} "
+                            f"(direction segment {seg_idx}: frames {seg_start}-{seg_end})"
+                        )
                 
                 # (Optional) Print the background process log to your main console for debugging
                 print(f"[PSRT Log] {line}")
@@ -99,9 +122,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.heatmap_overlay.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, False)
         self.heatmap_overlay.setStyleSheet(
             "QLabel#heatmap_overlay {"
-            "  background-color: rgba(255,255,255,220);"
-            "  border: 2px solid #444;"
-            "  border-radius: 8px;"
+            "  background-color: rgba(255,255,255,200);"
+            "  border: none;"
+            "  border-radius: 0px;"
             "}"
         )
         container_layout.addWidget(self.heatmap_overlay, 0, 0, alignment=QtCore.Qt.AlignCenter)
@@ -359,16 +382,20 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QApplication.processEvents()
 
         try:
-            loader = VideoLoader(output_fps=self.cfg.output_fps)
-
             self.sess.input_mode = self.cfg.input_mode
             self.sess.left_video_path = left_path
             self.sess.right_video_path = right_path
             self.sess.left_source_path = left_path
             self.sess.right_source_path = right_path
 
-            self.sess.left_frames_original = loader.extract_frames(left_path)
-            self.sess.right_frames_original = loader.extract_frames(right_path)
+            def _load_one(path: str) -> object:
+                return VideoLoader(output_fps=self.cfg.output_fps).extract_frames(path)
+
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                fut_left = ex.submit(_load_one, left_path)
+                fut_right = ex.submit(_load_one, right_path)
+                self.sess.left_frames_original = fut_left.result()
+                self.sess.right_frames_original = fut_right.result()
 
             if len(self.sess.left_frames_original) != len(self.sess.right_frames_original):
                 raise ValueError(

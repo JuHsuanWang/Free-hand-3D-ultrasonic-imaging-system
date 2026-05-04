@@ -72,6 +72,8 @@ class SessionState:
 
     # Segmentation results: list of (M,2) points for each frame
     contour_points_list: List[np.ndarray] = field(default_factory=list)
+    contour_points_left: List[np.ndarray] = field(default_factory=list)
+    contour_points_right: List[np.ndarray] = field(default_factory=list)
 
     # --- NEW: Manual Labeling Storage ---
     # Stores the user-drawn contours for specific frames.
@@ -85,6 +87,22 @@ class SessionState:
     # -------------------------
     y_heatmap: Optional[np.ndarray] = None              # (nL, nR), float32, NaN for invalid
     y_best_pairs: List[Tuple[int, int, float]] = field(default_factory=list)  # (l_idx, r_idx, min_val)
+
+    # -------------------------
+    # Scan direction detection
+    # -------------------------
+    # "forward": probe moves so Left plane sees structure first, Right plane follows (+Y stacking on right_frames)
+    # "reverse": probe moves opposite, Right plane sees structure first, Left plane follows (-Y stacking on left_frames)
+    scan_direction: str = "forward"
+    y_heatmap_fwd: Optional[np.ndarray] = None          # forward heatmap (nL, nR)
+    y_best_pairs_fwd: List[Tuple[int, int, float]] = field(default_factory=list)
+    y_heatmap_rev: Optional[np.ndarray] = None          # reverse heatmap (nR, nL)
+    y_best_pairs_rev: List[Tuple[int, int, float]] = field(default_factory=list)
+    scan_r2_fwd: float = float("nan")
+    scan_r2_rev: float = float("nan")
+    scan_direction_segments: List[Dict] = field(default_factory=list)
+    scan_direction_per_frame: List[str] = field(default_factory=list)
+    scan_y_positions: Optional[np.ndarray] = None
 
 
     # Visualization toggles

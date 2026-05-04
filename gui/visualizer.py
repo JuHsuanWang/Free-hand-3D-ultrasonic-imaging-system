@@ -2,15 +2,16 @@
 from __future__ import annotations
 from typing import Optional, List, Tuple, Dict
 import os
+import csv
 import cv2
 import numpy as np
 import pyvista as pv
 from concurrent.futures import ThreadPoolExecutor
+from scipy.io import savemat
 
 from algorithms.geometry import (
     img_to_world_xz,
     world_to_img_xz,
-    full_img_to_world_3d,
 )
 from core.session import SessionState
 from config import AppConfig
@@ -18,6 +19,7 @@ from algorithms.stabilizer import StabilizerConfig, SequenceStabilizer, to_gray_
 from algorithms.out_of_plane import (
     OutOfPlaneConfig,
     compute_lr_heatmap_like_matlab,
+    compute_scan_direction_heatmaps,
     OutOfPlaneRotConfig,
     compute_beta_gamma_from_right_grid,
 )
@@ -240,6 +242,64 @@ class VisualizerController:
         for a in self.band_border_actors:
             self._set_actor_visibility(a, self.sess.band_box_visible)
         self.plotter.render()
+
+    # -------------------------
+    # Scan-direction helpers
+    # -------------------------
+
+    def _get_y_spacing_signed(self) -> float:
+        """Y spacing with sign reflecting scan direction (negative for reverse)."""
+        if getattr(self.sess, "scan_direction", "forward") == "reverse":
+            return -float(self.cfg.y_spacing)
+        return float(self.cfg.y_spacing)
+
+    def _get_frame_direction(self, frame_idx: int) -> str:
+        if not bool(getattr(self.cfg, "enable_scan_direction_detection", True)):
+            return "forward"
+        dirs = getattr(self.sess, "scan_direction_per_frame", None)
+        if dirs is not None and 0 <= int(frame_idx) < len(dirs):
+            return str(dirs[int(frame_idx)])
+        return getattr(self.sess, "scan_direction", "forward")
+
+    def _get_y_spacing_signed_for_frame(self, frame_idx: int) -> float:
+        if self._get_frame_direction(frame_idx) == "reverse":
+            return -float(self.cfg.y_spacing)
+        return float(self.cfg.y_spacing)
+
+    def _get_y_position_for_frame(self, frame_idx: int) -> float:
+        ys = getattr(self.sess, "scan_y_positions", None)
+        if ys is not None and 0 <= int(frame_idx) < len(ys):
+            return float(ys[int(frame_idx)])
+        return float(frame_idx) * self._get_y_spacing_signed_for_frame(frame_idx)
+
+    def _get_display_frame_for_idx(self, frame_idx: int):
+        if self._get_frame_direction(frame_idx) == "reverse":
+            return self.sess.left_frames[frame_idx]
+        return self.sess.right_frames[frame_idx]
+
+    def _get_display_crop_for_idx(self, frame_idx: int):
+        if self._get_frame_direction(frame_idx) == "reverse":
+            return self.sess.cropped_left[frame_idx]
+        return self.sess.cropped_right[frame_idx]
+
+    def _get_display_contour_for_idx(self, frame_idx: int):
+        if self._get_frame_direction(frame_idx) == "reverse":
+            contours = getattr(self.sess, "contour_points_left", [])
+        else:
+            contours = getattr(self.sess, "contour_points_right", [])
+        if contours is not None and 0 <= int(frame_idx) < len(contours):
+            return contours[int(frame_idx)]
+        if 0 <= int(frame_idx) < len(self.sess.contour_points_list):
+            return self.sess.contour_points_list[int(frame_idx)]
+        return None
+
+    def _get_display_frames(self):
+        """Return (full_frames, cropped_frames) appropriate for the detected scan direction."""
+        if not bool(getattr(self.cfg, "enable_scan_direction_detection", True)):
+            return self.sess.right_frames, self.sess.cropped_right
+        if getattr(self.sess, "scan_direction", "forward") == "reverse":
+            return self.sess.left_frames, self.sess.cropped_left
+        return self.sess.right_frames, self.sess.cropped_right
 
     # -------------------------
     # Coordinate conversion
@@ -738,6 +798,7 @@ class VisualizerController:
         if len(contours) == 0:
             return np.empty((0, 2), dtype=np.float32)
 
+        all_points = []
         for contour in contours:
             area = cv2.contourArea(contour)
             if area >= self.cfg.min_contour_area:
@@ -749,29 +810,47 @@ class VisualizerController:
         return np.array(all_points, dtype=np.float32)
 
     def process_all_segmentations(self):
-        """Run segmentation for all ROI frames (multi-threaded)."""
-        n = len(self.sess.right_frames)
+        """Run segmentation for both planes; rendering picks the plane matching each segment direction."""
+        n = min(len(self.sess.right_frames), len(self.sess.left_frames))
         if n == 0:
             self.sess.contour_points_list = []
+            self.sess.contour_points_left = []
+            self.sess.contour_points_right = []
             return
 
-        self.sess.contour_points_list = [None] * n
+        self.sess.contour_points_left = [None] * n
+        self.sess.contour_points_right = [None] * n
 
-        def _seg_one(i: int):
+        def _seg_one(task):
+            side, i = task
             try:
-                pts = self.otsu_segmentation(self.sess.right_frames[i], self.cfg.bright_low, self.cfg.bright_high)
-                return i, pts
+                frame = self.sess.left_frames[i] if side == "left" else self.sess.right_frames[i]
+                pts = self.otsu_segmentation(frame, self.cfg.bright_low, self.cfg.bright_high)
+                return side, i, pts
             except Exception:
-                return i, np.empty((0, 2), dtype=np.float32)
+                return side, i, np.empty((0, 2), dtype=np.float32)
 
+        if bool(getattr(self.cfg, "enable_scan_direction_detection", True)):
+            tasks = [("left", i) for i in range(n)] + [("right", i) for i in range(n)]
+        else:
+            tasks = [("right", i) for i in range(n)]
         with ThreadPoolExecutor(max_workers=self.cfg.num_workers) as ex:
-            for i, pts in ex.map(_seg_one, range(n)):
-                self.sess.contour_points_list[i] = pts
+            for side, i, pts in ex.map(_seg_one, tasks):
+                if side == "left":
+                    self.sess.contour_points_left[i] = pts
+                else:
+                    self.sess.contour_points_right[i] = pts
 
-        total_points = sum(len(p) for p in self.sess.contour_points_list if p is not None)
+        self.sess.contour_points_list = [
+            self._get_display_contour_for_idx(i) for i in range(n)
+        ]
+
+        total_left = sum(len(p) for p in self.sess.contour_points_left if p is not None)
+        total_right = sum(len(p) for p in self.sess.contour_points_right if p is not None)
+        total_display = sum(len(p) for p in self.sess.contour_points_list if p is not None)
         print(
             f"  Segmentation complete (bright_range=[{self.cfg.bright_low},{self.cfg.bright_high}]): "
-            f"{total_points} total contour points"
+            f"display={total_display}, left={total_left}, right={total_right} contour points"
         )
 
     def run_processing(self):
@@ -808,7 +887,7 @@ class VisualizerController:
                 dz_mm=self.cfg.dz_mm,
 
                 # --- NEW: enable debug images like third code ---
-                save_debug=True,
+                save_debug=bool(self.cfg.save_stab_debug),
                 debug_out_dir=debug_r_dir,
                 debug_prefix="R",
                 # ----------------------------------------------
@@ -850,6 +929,23 @@ class VisualizerController:
         self.sess.band_left = self.crop_band_full_width(self.sess.left_frames[:n], cy)
         self.sess.band_right = self.crop_band_full_width(self.sess.right_frames[:n], cy)
 
+        # Detect scan direction before segmentation so each frame uses the correct plane.
+        self.update_status("Detecting scan direction (Y displacement heatmap)...")
+        self.plotter.render()
+        try:
+            self.compute_y_heatmap_like_matlab()
+            seg_count = len(getattr(self.sess, "scan_direction_segments", []))
+            if bool(getattr(self.cfg, "enable_scan_direction_detection", True)):
+                self.update_status(
+                    f"Direction segments: {seg_count} x {int(getattr(self.cfg, 'scan_direction_segment_frames', 100))} frames\n"
+                    "Running segmentation..."
+                )
+            else:
+                self.update_status("Fixed L->R heatmap computed.\nRunning segmentation...")
+        except Exception as _e:
+            print(f"[ScanDir] heatmap failed: {_e}")
+            self.update_status("Direction detection failed; using forward fallback.")
+
         # Segmentation on ROI frames
         self.update_status("Running segmentation...")
         self.plotter.render()
@@ -873,81 +969,27 @@ class VisualizerController:
             print(f"  Saved crops to {out_dir}")
 
         self.update_status("Processing done.")
-        # --- NEW: GT plot (optional) ---
-        if bool(self.cfg.enable_gt_plot):
+        if bool(getattr(self.cfg, "enable_tracker_like_export", False)):
             try:
-                from analysis.gt_plot import (
-                    load_em_perframe_motion,
-                    plot_gt_summary,
-                    write_alpha_beta_gamma_quat_csv,
-                )
-
-                # Ensure beta/gamma exists (so we can write quaternion CSV)
-                if self.sess.beta_deg is None or self.sess.gamma_deg is None:
-                    self.compute_beta_gamma_out_of_plane()
-
-                # load EM per-frame motion
-                em = load_em_perframe_motion(
-                    tracker_csv_path=self.cfg.tracker_csv_path,
-                    port=self.cfg.tracker_port,
-                    axis_map={"x": "Tx", "y": "Ty", "z": "Tz"},
-                )
-
-                base_dir = os.path.dirname(self.cfg.png_out_dir.rstrip("/\\"))
-                out_png = os.path.join(base_dir, self.cfg.gt_plot_filename)
-
-                plot_gt_summary(
-                    out_png_path=out_png,
-                    fh_dx_mm=np.asarray(self.sess.fh_dx_mm, dtype=np.float64),
-                    fh_dy_mm=np.asarray(self.sess.fh_dy_mm, dtype=np.float64),
-                    fh_dz_mm=np.asarray(self.sess.fh_dz_mm, dtype=np.float64),
-                    fh_dalpha_deg=np.asarray(self.sess.fh_dalpha_deg, dtype=np.float64),
-                    em_dx_mm=np.asarray(em["em_dx_mm"], dtype=np.float64),
-                    em_dy_mm=np.asarray(em["em_dy_mm"], dtype=np.float64),
-                    em_dz_mm=np.asarray(em["em_dz_mm"], dtype=np.float64),
-                    em_dalpha_deg=np.asarray(em["em_dalpha_deg"], dtype=np.float64),
-                )
-                print(f"[GT] Saved comparison plot: {out_png}")
-
-                # -----------------------------
-                # Quaternion CSV export
-                # -----------------------------
-                # Build per-frame alpha(t) from per-step delta alpha (alpha[0]=0)
-                dalpha = np.asarray(self.sess.fh_dalpha_deg, dtype=np.float64).reshape(-1)
-                n_frames = int(len(self.sess.right_frames)) if self.sess.right_frames is not None else int(dalpha.size + 1)
-                alpha_pf = np.zeros((n_frames,), dtype=np.float64)
-                if dalpha.size > 0:
-                    m = min(n_frames - 1, int(dalpha.size))
-                    alpha_pf[1:m+1] = np.cumsum(dalpha[:m])
-
-                beta_pf = np.asarray(self.sess.beta_deg, dtype=np.float64).reshape(-1)
-                gamma_pf = np.asarray(self.sess.gamma_deg, dtype=np.float64).reshape(-1)
-
-                out_csv = os.path.join(base_dir, "alpha_beta_gamma_quat.csv")
-                write_alpha_beta_gamma_quat_csv(
-                    out_csv_path=out_csv,
-                    alpha_deg_per_frame=alpha_pf,
-                    beta_deg_per_frame=beta_pf,
-                    gamma_deg_per_frame=gamma_pf,
-                )
-                print(f"[GT] Saved quaternion CSV: {out_csv}")
-
+                self.update_status("Exporting tracker-like CSV...")
+                self.plotter.render()
+                self.export_tracker_like_csv()
             except Exception as e:
-                print(f"[GT] Plot/CSV failed: {e}")
-        # -------------------------------
+                print(f"[TrackerLikeExport] Failed: {e}")
+
         if self.cfg.input_mode == "simulation":
             self.update_status("Simulation Mode: Running Auto-Labeling...")
             self.run_auto_labeling_simulation()
             self.update_status("Auto-Labeling Complete. Press 'Generate 3D' to finish.")
 
+        self.update_status("Building 3D view...")
+
         self.plotter.render()
 
     def compute_y_heatmap_like_matlab(self):
         """
-        MATLAB-like Y heatmap:
-        - normalizeImage (brightness+contrast)
-        - grid LK + valid_mask
-        - r starts from l+1
+        Compute both forward (L→R) and reverse (R→L) displacement heatmaps,
+        auto-detect scan direction, and store all results in session.
         """
         if self.sess.band_left is None or self.sess.band_right is None:
             self.sess.y_heatmap = None
@@ -965,128 +1007,346 @@ class VisualizerController:
             det_thresh=1e-6,
         )
 
-        # Use full-width band (MATLAB-style strip)
-        H, best = compute_lr_heatmap_like_matlab(self.sess.band_left, self.sess.band_right, of_cfg)
-        self.sess.y_heatmap = H
-        self.sess.y_best_pairs = best
+        n_frames = min(int(len(self.sess.band_left)), int(len(self.sess.band_right)))
+        heatmap_max_r_ahead = n_frames if self.cfg.input_mode == "live" else 100
+        use_scan_dir = bool(getattr(self.cfg, "enable_scan_direction_detection", True))
+        if use_scan_dir:
+            direction, H_fwd, best_fwd, H_rev, best_rev, r2_fwd, r2_rev = \
+                compute_scan_direction_heatmaps(
+                    self.sess.band_left,
+                    self.sess.band_right,
+                    of_cfg,
+                    max_r_ahead=heatmap_max_r_ahead,
+                )
+        else:
+            H_fwd, best_fwd = compute_lr_heatmap_like_matlab(
+                self.sess.band_left,
+                self.sess.band_right,
+                of_cfg,
+                max_r_ahead=heatmap_max_r_ahead,
+            )
+            H_rev, best_rev = None, []
+            r2_fwd, r2_rev = float("nan"), float("nan")
+            direction = "forward"
+
+        self.sess.scan_direction = direction
+        self.sess.y_heatmap_fwd = H_fwd
+        self.sess.y_best_pairs_fwd = best_fwd
+        self.sess.y_heatmap_rev = H_rev
+        self.sess.y_best_pairs_rev = best_rev
+        self.sess.scan_r2_fwd = r2_fwd
+        self.sess.scan_r2_rev = r2_rev
+
+        seg_len = max(1, int(getattr(self.cfg, "scan_direction_segment_frames", 100)))
+        segments = []
+        per_frame = [direction] * n_frames
+
+        def _robust_line_fit(best_pairs):
+            if len(best_pairs) < 3:
+                return float("nan"), float("nan"), float("nan"), float("nan")
+            xs = np.array([p[0] for p in best_pairs], dtype=np.float64)
+            ys = np.array([p[1] for p in best_pairs], dtype=np.float64)
+            if len(xs) >= 5:
+                a0, b0 = np.polyfit(xs, ys, 1)
+                res = ys - (a0 * xs + b0)
+                med = np.median(res)
+                mad = float(np.median(np.abs(res - med))) + 1e-6
+                inl = np.abs(res - med) < 2.0 * mad
+                if np.sum(inl) >= 3:
+                    xs, ys = xs[inl], ys[inl]
+            a, b = np.polyfit(xs, ys, 1)
+            y_fit = a * xs + b
+            residuals = ys - y_fit
+            ss_res = float(np.sum((ys - y_fit) ** 2))
+            ss_tot = float(np.sum((ys - float(np.mean(ys))) ** 2))
+            r2 = float("nan") if ss_tot < 1e-12 else float(1.0 - ss_res / ss_tot)
+            resid_std = float(np.std(residuals)) if residuals.size > 0 else float("nan")
+            return r2, float(a), float(b), resid_std
+
+        _, global_slope_fwd, global_intercept_fwd, _ = _robust_line_fit(best_fwd)
+        _, global_slope_rev, global_intercept_rev, _ = _robust_line_fit(best_rev)
+
+        def _seg_fit(best_pairs, start: int, end: int, global_slope: float, global_intercept: float):
+            sub = [p for p in best_pairs if start <= int(p[0]) < end]
+            r2, a, b, _seg_resid_std = _robust_line_fit(sub)
+            if len(sub) < 3 or not np.isfinite(global_slope) or not np.isfinite(global_intercept):
+                return r2, a, b, float("nan")
+
+            xs = np.array([p[0] for p in sub], dtype=np.float64)
+            ys = np.array([p[1] for p in sub], dtype=np.float64)
+            residuals_to_global = ys - (global_slope * xs + global_intercept)
+            resid_std_global = float(np.std(residuals_to_global)) if residuals_to_global.size > 0 else float("nan")
+            return r2, a, b, resid_std_global
+
+        if use_scan_dir:
+            for start in range(0, n_frames, seg_len):
+                end = min(start + seg_len, n_frames)
+                sr2_fwd, slope_fwd, intercept_fwd, std_fwd = _seg_fit(
+                    best_fwd, start, end, global_slope_fwd, global_intercept_fwd
+                )
+                sr2_rev, slope_rev, intercept_rev, std_rev = _seg_fit(
+                    best_rev, start, end, global_slope_rev, global_intercept_rev
+                )
+                if np.isnan(std_fwd) and np.isnan(std_rev):
+                    seg_dir = direction
+                elif np.isnan(std_rev) or (not np.isnan(std_fwd) and std_fwd <= std_rev):
+                    seg_dir = "forward"
+                else:
+                    seg_dir = "reverse"
+                active_r2 = sr2_fwd if seg_dir == "forward" else sr2_rev
+                active_slope = slope_fwd if seg_dir == "forward" else slope_rev
+                active_intercept = intercept_fwd if seg_dir == "forward" else intercept_rev
+                active_std = std_fwd if seg_dir == "forward" else std_rev
+
+                segments.append({
+                    "start": int(start),
+                    "end": int(end),
+                    "direction": seg_dir,
+                    "r2_fwd": float(sr2_fwd),
+                    "r2_rev": float(sr2_rev),
+                    "slope_fwd": float(slope_fwd),
+                    "slope_rev": float(slope_rev),
+                    "intercept_fwd": float(intercept_fwd),
+                    "intercept_rev": float(intercept_rev),
+                    "std_fwd": float(std_fwd),
+                    "std_rev": float(std_rev),
+                    "r2": float(active_r2),
+                    "slope": float(active_slope),
+                    "intercept": float(active_intercept),
+                    "std": float(active_std),
+                })
+                for i in range(start, end):
+                    per_frame[i] = seg_dir
+        else:
+            r2_fixed, slope_fixed, intercept_fixed, std_fixed = _seg_fit(
+                best_fwd, 0, n_frames, global_slope_fwd, global_intercept_fwd
+            )
+            r2_fwd = r2_fixed
+            self.sess.scan_r2_fwd = r2_fixed
+            segments.append({
+                "start": 0,
+                "end": int(n_frames),
+                "direction": "forward",
+                "r2_fwd": float(r2_fixed),
+                "r2_rev": float("nan"),
+                "slope_fwd": float(slope_fixed),
+                "slope_rev": float("nan"),
+                "intercept_fwd": float(intercept_fixed),
+                "intercept_rev": float("nan"),
+                "std_fwd": float(std_fixed),
+                "std_rev": float("nan"),
+                "r2": float(r2_fixed),
+                "slope": float(slope_fixed),
+                "intercept": float(intercept_fixed),
+                "std": float(std_fixed),
+            })
+
+        y_positions = np.zeros((n_frames,), dtype=np.float64)
+        for i in range(1, n_frames):
+            step = -float(self.cfg.y_spacing) if per_frame[i] == "reverse" else float(self.cfg.y_spacing)
+            y_positions[i] = y_positions[i - 1] + step
+
+        self.sess.scan_direction_segments = segments
+        self.sess.scan_direction_per_frame = per_frame
+        self.sess.scan_y_positions = y_positions
+
+        # backward-compatible attributes point to the active direction
+        self.sess.y_heatmap = H_fwd if direction == "forward" or H_rev is None else H_rev
+        self.sess.y_best_pairs = best_fwd if direction == "forward" or H_rev is None else best_rev
+
+        mode_label = "segmented forward/reverse" if use_scan_dir else "fixed L->R"
+        print(
+            f"[ScanDir] mode={mode_label}  max_r_ahead={heatmap_max_r_ahead}  "
+            f"direction={direction}  R2_fwd={r2_fwd:.3f}  R2_rev={r2_rev:.3f}"
+        )
+        for seg in segments:
+            print(
+                f"[ScanDir] frames {seg['start']:04d}-{seg['end'] - 1:04d}: "
+                f"{seg['direction']}  R2={seg['r2']:.3f}  intercept={seg['intercept']:.2f}  "
+                f"std_to_global_fwd={seg['std_fwd']:.3f}  std_to_global_rev={seg['std_rev']:.3f}  "
+                f"R2_fwd={seg['r2_fwd']:.3f}  R2_rev={seg['r2_rev']:.3f}"
+            )
 
     
     def show_out_of_plane_heatmap_overlay(self):
         """
-        Render heatmap to PNG and show it in the overlay QLabel at the center of PyVista view.
+        2-panel heatmap overlay: Forward (L→R) | Reverse (R→L).
+        Selected direction shown in colour; ±1 local-std band drawn around regression line.
         Click overlay to hide.
         """
         if self.heatmap_overlay_label is None:
-            print("[YHeatmap] overlay label not set (did you assign in MainWindow?)")
             return
 
-        if self.sess.y_heatmap is None or self.sess.y_heatmap.size == 0:
+        s = self.sess
+        H_fwd = getattr(s, "y_heatmap_fwd", None)
+        H_rev = getattr(s, "y_heatmap_rev", None)
+        if (H_fwd is None or H_fwd.size == 0) and (H_rev is None or H_rev.size == 0):
             return
 
-        from PyQt5 import QtGui, QtCore, QtWidgets
+        from PyQt5 import QtGui, QtCore
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         from io import BytesIO
 
-        H = self.sess.y_heatmap  # (nL, nR)
+        r2_fwd = float(getattr(s, "scan_r2_fwd", float("nan")))
+        r2_rev = float(getattr(s, "scan_r2_rev", float("nan")))
+        best_fwd = list(getattr(s, "y_best_pairs_fwd", []))
+        best_rev = list(getattr(s, "y_best_pairs_rev", []))
+        segments = list(getattr(s, "scan_direction_segments", []))
+        seg_len = int(getattr(self.cfg, "scan_direction_segment_frames", 100))
+        use_scan_dir = bool(getattr(self.cfg, "enable_scan_direction_detection", True))
 
-        fig = plt.figure(figsize=(7.2, 6.0), dpi=150)
-        ax = fig.add_subplot(111)
+        CLR_FWD_SEL = "#1a8a1a"
+        CLR_REV_SEL = "#1a1aaa"
 
-        Ht = H.T  # (nR, nL)
-        m = np.ma.masked_invalid(Ht)
+        finite_vals = []
+        for H in (H_fwd, H_rev):
+            if H is not None and H.size > 0:
+                vals = np.asarray(H, dtype=np.float64)
+                vals = vals[np.isfinite(vals)]
+                if vals.size > 0:
+                    finite_vals.append(vals)
+        if finite_vals:
+            all_vals = np.concatenate(finite_vals)
+            heat_vmin = float(np.min(all_vals))
+            heat_vmax = float(np.max(all_vals))
+            if not np.isfinite(heat_vmin) or not np.isfinite(heat_vmax) or heat_vmax <= heat_vmin:
+                heat_vmin, heat_vmax = None, None
+        else:
+            heat_vmin, heat_vmax = None, None
 
-        ax.set_facecolor("white")
-        im = ax.imshow(m, cmap="gray", origin="lower", aspect="auto")
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        if use_scan_dir:
+            fig = plt.figure(figsize=(14.4, 7.2), dpi=100)
+            ax_fwd = fig.add_subplot(1, 2, 1)
+            ax_rev = fig.add_subplot(1, 2, 2)
+        else:
+            fig = plt.figure(figsize=(8.4, 8.4), dpi=100)
+            ax_fwd = fig.add_subplot(1, 1, 1)
+            ax_rev = None
 
-        ax.set_xlabel("Left RX Reference Frame (frame #)")
-        ax.set_ylabel("Right RX Frame (frame #)")
-        ax.set_title("Optical Flow Displacement Heat Map (L vs R)")
-        # NEW: clamp Y axis to actual max frame (remove top whitespace)
-        if self.sess.y_heatmap is not None and self.sess.y_heatmap.size > 0:
-            ymax = int(self.sess.y_heatmap.shape[0] - 1)
-            ax.set_ylim(0, ymax)
+        def _panel_segments(ax, panel_direction: str):
+            if not segments:
+                return
+            for seg in segments:
+                start = int(seg["start"])
+                end = int(seg["end"])
+                color = CLR_FWD_SEL if seg["direction"] == "forward" else CLR_REV_SEL
+                ax.axvspan(start, end - 1, color=color, alpha=0.055, zorder=1)
+                ax.axvline(start, color=color, linewidth=1.0, alpha=0.45, zorder=7)
+            ax.axvline(int(segments[-1]["end"]) - 1, color="#444444", linewidth=0.8, alpha=0.35, zorder=7)
+
+        # ── inner helper ──────────────────────────────────────────────────
+        def _draw_panel(ax, H, best_pairs, xlabel, ylabel):
+            if H is None or H.size == 0:
+                ax.text(0.5, 0.5, "N/A", transform=ax.transAxes,
+                        ha="center", va="center", fontsize=18, color="#888")
+                ax.set_xlabel(xlabel, fontsize=13)
+                ax.set_ylabel(ylabel, fontsize=13)
+                return None
+
+            Ht = H.T
+            ax.set_facecolor("white")
+            aspect = "auto" if use_scan_dir else "equal"
+            im = ax.imshow(np.ma.masked_invalid(Ht),
+                           cmap="gray", origin="lower", aspect=aspect,
+                           vmin=heat_vmin, vmax=heat_vmax)
+            ax.set_ylim(0, H.shape[0] - 1)
             ax.margins(y=0)
 
-        if self.sess.y_best_pairs:
-            # -----------------------------
-            # 1. collect points
-            # -----------------------------
-            xs = np.array([l for (l, r, v) in self.sess.y_best_pairs], dtype=np.float64)
-            ys = np.array([r for (l, r, v) in self.sess.y_best_pairs], dtype=np.float64)
+            if len(best_pairs) >= 5:
+                xs = np.array([p[0] for p in best_pairs], dtype=np.float64)
+                ys = np.array([p[1] for p in best_pairs], dtype=np.float64)
 
-            if len(xs) >= 5:
-                # -----------------------------
-                # 2. initial linear fit
-                # -----------------------------
+                # robust regression
                 a0, b0 = np.polyfit(xs, ys, 1)
-                y_pred0 = a0 * xs + b0
-                residuals = ys - y_pred0
+                res0 = ys - (a0 * xs + b0)
+                mad = float(np.median(np.abs(res0 - np.median(res0)))) + 1e-6
+                inl = np.abs(res0 - np.median(res0)) < 2.0 * mad
+                xs_in = xs[inl] if np.sum(inl) >= 3 else xs
+                ys_in = ys[inl] if np.sum(inl) >= 3 else ys
+                xs_out = xs[~inl] if np.sum(inl) >= 3 else np.array([])
+                ys_out = ys[~inl] if np.sum(inl) >= 3 else np.array([])
 
-                # -----------------------------
-                # 3. MAD-based outlier removal
-                # -----------------------------
-                med = np.median(residuals)
-                mad = np.median(np.abs(residuals - med)) + 1e-6
-                inlier_mask = np.abs(residuals - med) < 2.0 * mad
-
-                xs_in = xs[inlier_mask]
-                ys_in = ys[inlier_mask]
-                xs_out = xs[~inlier_mask]
-                ys_out = ys[~inlier_mask]
-
-                # -----------------------------
-                # 4. final regression (inliers)
-                # -----------------------------
                 a, b = np.polyfit(xs_in, ys_in, 1)
-                y_fit = a * xs_in + b
+                residuals = ys_in - (a * xs_in + b)
 
-                # R^2
-                ss_res = np.sum((ys_in - y_fit) ** 2)
-                ss_tot = np.sum((ys_in - np.mean(ys_in)) ** 2)
-                r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+                # ── ±1 local-std band ──────────────────────────────────
+                x_eval = np.linspace(float(xs_in.min()), float(xs_in.max()), 300)
+                win_h  = max((float(xs_in.max()) - float(xs_in.min())) * 0.08, 3.0)
+                global_std = float(np.std(residuals)) if len(residuals) > 1 else 0.0
+                local_std = np.zeros(len(x_eval))
+                for k, xc in enumerate(x_eval):
+                    mask = np.abs(xs_in - xc) <= win_h
+                    local_std[k] = float(np.std(residuals[mask])) \
+                        if np.sum(mask) >= 2 else global_std
+                y_eval = a * x_eval + b
+                ax.fill_between(x_eval,
+                                y_eval - local_std,
+                                y_eval + local_std,
+                                alpha=0.30, color="cyan", zorder=4,
+                                label="±1 local std")
+                # ──────────────────────────────────────────────────────
 
-                # -----------------------------
-                # 5. draw points
-                # -----------------------------
-                # outliers (white)
-                if len(xs_out) > 0:
-                    ax.scatter(xs_out, ys_out, s=3, c="white", edgecolors="none", alpha=0.9)
+                # scatter
+                if len(xs_out):
+                    ax.scatter(xs_out, ys_out, s=6, c="white",
+                               edgecolors="none", alpha=0.7, zorder=3)
+                ax.scatter(xs_in, ys_in, s=5, c="red", zorder=5,
+                           label="Best match pairs")
 
-                # inliers (red)
-                ax.scatter(xs_in, ys_in, s=2, c="red")
+                x_line = np.array([0.0, float(xs.max())])
+                ax.plot(x_line, a * x_line + b,
+                        color="yellow", linewidth=2.0, zorder=6,
+                        label="Linear regression")
 
-                # -----------------------------
-                # 6. draw regression line
-                # -----------------------------
-                x_line = np.array([0, np.max(xs)])
-                y_line = a * x_line + b
-                ax.plot(x_line, y_line, color="yellow", linewidth=1.5)
+                # R² / slope annotation
+                ax.legend(fontsize=10, loc="upper left",
+                          framealpha=0.75, edgecolor="none")
 
-                # -----------------------------
-                # 7. annotate R^2 and intercept
-                # -----------------------------
-                ax.text(
-                    0.98, 0.02,
-                    f"$R^2$ = {r2:.3f}\nIntercept (x=0): {b:.2f}",
-                    transform=ax.transAxes,
-                    ha="right",
-                    va="bottom",
-                    fontsize=10,
-                    bbox=dict(facecolor="white", alpha=0.7, edgecolor="none")
-                )
+            elif len(best_pairs) >= 2:
+                xs = np.array([p[0] for p in best_pairs], dtype=np.float64)
+                ys = np.array([p[1] for p in best_pairs], dtype=np.float64)
+                ax.scatter(xs, ys, s=5, c="red", zorder=4)
 
-            else:
-                # fallback: too few points
-                ax.scatter(xs, ys, s=2, c="red")
+            ax.set_xlabel(xlabel, fontsize=13)
+            ax.set_ylabel(ylabel, fontsize=13)
+            ax.tick_params(labelsize=11)
+            ax.grid(True, alpha=0.25)
+            return im
+        # ──────────────────────────────────────────────────────────────────
 
+        im_fwd = _draw_panel(ax_fwd, H_fwd, best_fwd,
+                             "Left frame #  (reference)",
+                             "Right frame #  (comparison)")
+        im_rev = None
+        if use_scan_dir and ax_rev is not None:
+            im_rev = _draw_panel(ax_rev, H_rev, best_rev,
+                                 "Right frame #  (reference)",
+                                 "Left frame #  (comparison)")
 
-        ax.grid(True, alpha=0.25)
+        # ── panel titles (no spine borders) ───────────────────────────────
+        if use_scan_dir:
+            _panel_segments(ax_fwd, "forward")
+            _panel_segments(ax_rev, "reverse")
 
+        if use_scan_dir:
+            ax_fwd.set_title("FORWARD  L -> R", color=CLR_FWD_SEL, fontsize=14, fontweight="bold")
+            ax_rev.set_title("REVERSE  R -> L", color=CLR_REV_SEL, fontsize=14, fontweight="bold")
+        else:
+            ax_fwd.set_title("Fixed L(reference) -> R(comparison)", color=CLR_FWD_SEL, fontsize=14, fontweight="bold")
+
+        if im_fwd is not None:
+            fig.colorbar(im_fwd, ax=ax_fwd, fraction=0.046, pad=0.04)
+        if im_rev is not None:
+            fig.colorbar(im_rev, ax=ax_rev, fraction=0.046, pad=0.04)
+
+        # ── overall title + stacking info ────────────────────────────────
+        title = (f"Y Displacement Heatmap - segmented direction every {seg_len} frames"
+                 if use_scan_dir else "Y Displacement Heatmap - fixed L -> R")
+        fig.suptitle(title, fontsize=17, fontweight="bold")
         buf = BytesIO()
-        fig.tight_layout()
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
         fig.savefig(buf, format="png")
         plt.close(fig)
         buf.seek(0)
@@ -1094,40 +1354,36 @@ class VisualizerController:
         pix = QtGui.QPixmap()
         pix.loadFromData(buf.getvalue(), "PNG")
 
-        # scale to ~80% of vtk widget size (keep aspect)
-        parent = self.heatmap_overlay_label.parentWidget()
-        if parent is None:
-            parent = self.heatmap_overlay_label
-        max_w = int(parent.width() * 0.80)
-        max_h = int(parent.height() * 0.80)
-        pix = pix.scaled(max_w, max_h, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+        parent = self.heatmap_overlay_label.parentWidget() or self.heatmap_overlay_label
+        max_w = int(parent.width() * 0.93)
+        max_h = int(parent.height() * 0.90)
+        pix = pix.scaled(max_w, max_h,
+                         QtCore.Qt.KeepAspectRatio,
+                         QtCore.Qt.SmoothTransformation)
 
         self.heatmap_overlay_label.setPixmap(pix)
         self.heatmap_overlay_label.setFixedSize(pix.size())
         self.heatmap_overlay_label.setVisible(True)
         self.heatmap_overlay_label.raise_()
 
-        # click-to-hide (install once)
         if not hasattr(self.heatmap_overlay_label, "_hide_installed"):
             self.heatmap_overlay_label._hide_installed = True
-
-            def _mousePressEvent(evt):
-                self.heatmap_overlay_label.setVisible(False)
-
-            self.heatmap_overlay_label.mousePressEvent = _mousePressEvent
+            self.heatmap_overlay_label.mousePressEvent = \
+                lambda evt: self.heatmap_overlay_label.setVisible(False)
 
 
     def on_show_y_heatmap(self):
         if not self.sess.selection_confirmed:
             return
 
-        # NEW: toggle behavior
+        # toggle: hide if already visible
         if self.heatmap_overlay_label.isVisible():
             self.heatmap_overlay_label.setVisible(False)
             return
 
-        if self.sess.y_heatmap is None or self.sess.y_heatmap.size == 0:
-            self.update_status("Computing out-of-plane (Y) heatmap ...")
+        # Heatmap is computed inside run_processing(); this is only a fallback
+        if self.sess.y_heatmap_fwd is None:
+            self.update_status("Computing Y heatmap...")
             self.plotter.render()
             self.compute_y_heatmap_like_matlab()
             self.update_status("Ready.")
@@ -1137,10 +1393,19 @@ class VisualizerController:
 
     def compute_beta_gamma_out_of_plane(self):
         """
-        Compute per-frame beta/gamma (deg) using R-plane 3x3 grid patches (exclude center),
-        comparing each frame with its next 5 frames (median aggregation).
+        Compute per-frame beta/gamma (deg) using 3x3 grid patches (exclude center).
+        Uses RIGHT frames for forward scan direction, LEFT frames for reverse.
         """
-        if self.sess.right_frames is None or self.sess.click_point is None:
+        if self.sess.click_point is None:
+            self.sess.beta_deg = None
+            self.sess.gamma_deg = None
+            return
+
+        direction = getattr(self.sess, "scan_direction", "forward")
+        frames_for_bg = (self.sess.left_frames if direction == "reverse"
+                         else self.sess.right_frames)
+
+        if frames_for_bg is None:
             self.sess.beta_deg = None
             self.sess.gamma_deg = None
             return
@@ -1157,14 +1422,13 @@ class VisualizerController:
             enable_time_median_filter=bool(self.cfg.enable_beta_gamma_median_filter),
             time_median_win=int(self.cfg.beta_gamma_median_win),
 
-            cell_size=int(self.cfg.crop_size),   # 100
+            cell_size=int(self.cfg.crop_size),
             exclude_center=True,
             min_patches_for_fit=4,
         )
 
-
         beta, gamma = compute_beta_gamma_from_right_grid(
-            self.sess.right_frames,
+            frames_for_bg,
             click_point_xy=self.sess.click_point,
             cfg=rot_cfg,
         )
@@ -1201,9 +1465,13 @@ class VisualizerController:
         ax1 = fig.add_subplot(211)
         ax2 = fig.add_subplot(212, sharex=ax1)
 
+        direction = getattr(self.sess, "scan_direction", "forward")
+        plane_label = "RIGHT plane" if direction == "forward" else "LEFT plane"
         ax1.plot(x, beta, linewidth=1.4)
         ax1.set_ylabel("beta (deg)")
-        ax1.set_title("Out-of-plane Rotation (R 3x3 Grid, exclude center, lookahead=10)")
+        ax1.set_title(
+            f"Out-of-plane Rotation ({plane_label}, 3×3 grid, excl. center, lookahead=10)"
+        )
         ax1.grid(True, alpha=0.25)
 
         ax2.plot(x, gamma, linewidth=1.4)
@@ -1240,7 +1508,7 @@ class VisualizerController:
             # keep same click-to-hide UX
             self.heatmap_overlay_label.mousePressEvent = _mousePressEvent
 
-        # Save PNG to output/<run_name>/... (same folder logic as your GT plot)
+        # Save PNG to output/<run_name>/...
         try:
             base_dir = os.path.dirname(self.cfg.png_out_dir.rstrip("/\\"))
             out_png = os.path.join(base_dir, "beta_gamma.png")
@@ -1297,7 +1565,7 @@ class VisualizerController:
         s.manual_contours.clear() 
 
         for i in range(0, n, stride):
-            frame = s.right_frames[i]
+            frame = self._get_display_frame_for_idx(i)
             # Convert to grayscale
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame.copy()
 
@@ -1526,7 +1794,7 @@ class VisualizerController:
             self.label2d_full_actor = None
         
         # --- Build a single ROI plane at y=0 (full cyan ROI) ---
-        frame = self.sess.right_frames[idx]
+        frame = self._get_display_frame_for_idx(idx)
         if frame.ndim == 3 and frame.shape[2] == 4:
             rgba = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGBA)
         else:
@@ -1821,14 +2089,15 @@ class VisualizerController:
 
         points_2d = self.sess.manual_contours[idx]
         pts_3d = []
-        
-        y_pos = idx * self.cfg.y_spacing
+
+        y_pos = self._get_y_position_for_frame(idx)
         center = np.array([self.sess.frame_w * 0.5, y_pos, self.sess.frame_h * 0.5], dtype=np.float32)
         beta = self.sess.beta_deg[idx] if (self.sess.beta_deg is not None and idx < len(self.sess.beta_deg)) else 0.0
         gamma = self.sess.gamma_deg[idx] if (self.sess.gamma_deg is not None and idx < len(self.sess.gamma_deg)) else 0.0
 
         for (u, v) in points_2d:
-            wx, wy, wz = full_img_to_world_3d(u, v, idx, self.sess.frame_h, self.cfg.y_spacing)
+            wx, wz = self.img_to_world(int(u), int(v), self.sess.frame_h)
+            wy = y_pos
             pts_3d.append([wx, wy, wz])
         
         pts_3d.append(pts_3d[0]) # Close loop
@@ -1839,7 +2108,249 @@ class VisualizerController:
         poly = pv.lines_from_points(pts_rot, close=False)
         self.temp_label_actor = self.plotter.add_mesh(poly, color="lime", line_width=3)
 
+    def _get_eval_export_path(self) -> str:
+        base_dir = os.path.dirname(self.cfg.png_out_dir.rstrip("/\\"))
+        if base_dir == "":
+            base_dir = "."
+        return os.path.join(base_dir, self.cfg.eval_export_filename)
 
+    def _get_tracker_like_export_path(self) -> str:
+        base_dir = os.path.dirname(self.cfg.png_out_dir.rstrip("/\\"))
+        if base_dir == "":
+            base_dir = "."
+        return os.path.join(base_dir, self.cfg.tracker_like_export_filename)
+
+    @staticmethod
+    def _rotmat_to_quat_wxyz(R: np.ndarray) -> tuple[float, float, float, float]:
+        R = np.asarray(R, dtype=np.float64)
+        tr = float(np.trace(R))
+        if tr > 0.0:
+            s = np.sqrt(tr + 1.0) * 2.0
+            qw = 0.25 * s
+            qx = (R[2, 1] - R[1, 2]) / s
+            qy = (R[0, 2] - R[2, 0]) / s
+            qz = (R[1, 0] - R[0, 1]) / s
+        elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+            s = np.sqrt(max(0.0, 1.0 + R[0, 0] - R[1, 1] - R[2, 2])) * 2.0
+            qw = (R[2, 1] - R[1, 2]) / s if s > 0 else 1.0
+            qx = 0.25 * s
+            qy = (R[0, 1] + R[1, 0]) / s if s > 0 else 0.0
+            qz = (R[0, 2] + R[2, 0]) / s if s > 0 else 0.0
+        elif R[1, 1] > R[2, 2]:
+            s = np.sqrt(max(0.0, 1.0 + R[1, 1] - R[0, 0] - R[2, 2])) * 2.0
+            qw = (R[0, 2] - R[2, 0]) / s if s > 0 else 1.0
+            qx = (R[0, 1] + R[1, 0]) / s if s > 0 else 0.0
+            qy = 0.25 * s
+            qz = (R[1, 2] + R[2, 1]) / s if s > 0 else 0.0
+        else:
+            s = np.sqrt(max(0.0, 1.0 + R[2, 2] - R[0, 0] - R[1, 1])) * 2.0
+            qw = (R[1, 0] - R[0, 1]) / s if s > 0 else 1.0
+            qx = (R[0, 2] + R[2, 0]) / s if s > 0 else 0.0
+            qy = (R[1, 2] + R[2, 1]) / s if s > 0 else 0.0
+            qz = 0.25 * s
+
+        q = np.array([qw, qx, qy, qz], dtype=np.float64)
+        n = float(np.linalg.norm(q))
+        if n <= 0.0:
+            return 1.0, 0.0, 0.0, 0.0
+        q /= n
+        return float(q[0]), float(q[1]), float(q[2]), float(q[3])
+
+    @staticmethod
+    def _euler_yxz_deg_to_rotmat(alpha_deg: float, beta_deg: float, gamma_deg: float) -> np.ndarray:
+        a = np.deg2rad(float(alpha_deg))
+        b = np.deg2rad(float(beta_deg))
+        g = np.deg2rad(float(gamma_deg))
+
+        ca, sa = np.cos(a), np.sin(a)
+        cb, sb = np.cos(b), np.sin(b)
+        cg, sg = np.cos(g), np.sin(g)
+
+        Ry = np.array([[ca, 0.0, sa],
+                       [0.0, 1.0, 0.0],
+                       [-sa, 0.0, ca]], dtype=np.float64)
+        Rx = np.array([[1.0, 0.0, 0.0],
+                       [0.0, cb, -sb],
+                       [0.0, sb, cb]], dtype=np.float64)
+        Rz = np.array([[cg, -sg, 0.0],
+                       [sg, cg, 0.0],
+                       [0.0, 0.0, 1.0]], dtype=np.float64)
+        return Ry @ Rx @ Rz
+
+    def export_tracker_like_csv(self):
+        if self.sess.right_frames is None:
+            raise ValueError("No frames available for tracker-like export.")
+
+        n_frames = int(len(self.sess.right_frames))
+        if n_frames <= 0:
+            raise ValueError("No frames available for tracker-like export.")
+
+        if self.sess.beta_deg is None or self.sess.gamma_deg is None:
+            self.compute_beta_gamma_out_of_plane()
+
+        dx = np.asarray(self.sess.fh_dx_mm if self.sess.fh_dx_mm is not None else [], dtype=np.float64).reshape(-1)
+        dz = np.asarray(self.sess.fh_dz_mm if self.sess.fh_dz_mm is not None else [], dtype=np.float64).reshape(-1)
+        da = np.asarray(self.sess.fh_dalpha_deg if self.sess.fh_dalpha_deg is not None else [], dtype=np.float64).reshape(-1)
+
+        tx = np.zeros((n_frames,), dtype=np.float64)
+        tz = np.zeros((n_frames,), dtype=np.float64)
+        alpha = np.zeros((n_frames,), dtype=np.float64)
+        m = min(n_frames - 1, dx.size)
+        if m > 0:
+            tx[1:m + 1] = np.cumsum(dx[:m])
+        m = min(n_frames - 1, dz.size)
+        if m > 0:
+            tz[1:m + 1] = np.cumsum(dz[:m])
+        m = min(n_frames - 1, da.size)
+        if m > 0:
+            alpha[1:m + 1] = np.cumsum(da[:m])
+
+        ys = getattr(self.sess, "scan_y_positions", None)
+        if ys is not None and len(ys) >= n_frames:
+            y_display = np.asarray(ys[:n_frames], dtype=np.float64)
+            y_scale_to_mm = float(self.cfg.fh_dy_mm_per_frame) / float(self.cfg.y_spacing)
+            ty = y_display * y_scale_to_mm
+        else:
+            ty = np.arange(n_frames, dtype=np.float64) * float(self.cfg.fh_dy_mm_per_frame)
+
+        beta = np.asarray(self.sess.beta_deg if self.sess.beta_deg is not None else [], dtype=np.float64).reshape(-1)
+        gamma = np.asarray(self.sess.gamma_deg if self.sess.gamma_deg is not None else [], dtype=np.float64).reshape(-1)
+
+        out_path = self._get_tracker_like_export_path()
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        with open(out_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Frame#", "PortHandle", "Face#", "TransformStatus",
+                             "Q0", "Qx", "Qy", "Qz", "Tx", "Ty", "Tz",
+                             "Error", "#Markers", "Tools"])
+            for i in range(n_frames):
+                b = float(beta[i]) if i < beta.size and np.isfinite(beta[i]) else 0.0
+                g = float(gamma[i]) if i < gamma.size and np.isfinite(gamma[i]) else 0.0
+                R = self._euler_yxz_deg_to_rotmat(alpha[i], b, g)
+                q0, qx, qy, qz = self._rotmat_to_quat_wxyz(R)
+                writer.writerow([
+                    int(i),
+                    str(self.cfg.tracker_like_port),
+                    0,
+                    "Enabled",
+                    f"{q0:.9g}",
+                    f"{qx:.9g}",
+                    f"{qy:.9g}",
+                    f"{qz:.9g}",
+                    f"{tx[i]:.9g}",
+                    f"{ty[i]:.9g}",
+                    f"{tz[i]:.9g}",
+                    "0",
+                    "0",
+                    "1",
+                ])
+        print(f"[TrackerLikeExport] Saved: {out_path}")
+
+    def _mesh_to_eval_dict(self, mesh_mm: pv.PolyData) -> dict:
+        if mesh_mm is None or mesh_mm.n_points == 0:
+            return {
+                "vertices_mm": np.zeros((0, 3), dtype=np.float32),
+                "faces": np.zeros((0, 3), dtype=np.int32),
+                "num_vertices": 0,
+                "num_faces": 0,
+                "is_closed": False,
+                "volume_mm3": float("nan"),
+                "volume_ml": float("nan"),
+            }
+
+        vertices = np.asarray(mesh_mm.points, dtype=np.float32)
+
+        faces_raw = np.asarray(mesh_mm.faces)
+        if faces_raw.size == 0:
+            faces = np.zeros((0, 3), dtype=np.int32)
+        else:
+            # PyVista triangular faces are stored as [3, i, j, k, 3, i, j, k, ...]
+            faces = faces_raw.reshape(-1, 4)[:, 1:4].astype(np.int32)
+
+        # MATLAB uses 1-based indexing
+        faces_matlab = faces + 1
+
+        is_closed = True
+        try:
+            is_closed = (int(mesh_mm.n_open_edges) == 0)
+        except Exception:
+            pass
+
+        return {
+            "vertices_mm": vertices,
+            "faces": faces_matlab,
+            "num_vertices": int(vertices.shape[0]),
+            "num_faces": int(faces.shape[0]),
+            "is_closed": bool(is_closed),
+            "volume_mm3": float(self.sess.surface_volume_mm3) if self.sess.surface_volume_mm3 is not None else float("nan"),
+            "volume_ml": float(self.sess.surface_volume_ml) if self.sess.surface_volume_ml is not None else float("nan"),
+        }
+    
+    def _build_pred_eval_export_struct(self) -> dict:
+        stride = int(getattr(self.cfg, "eval_export_stride", 10))
+        n_frames = len(self.sess.right_frames) if self.sess.right_frames is not None else 0
+
+        sampled_idx0 = list(range(0, n_frames, stride))
+
+        contours_2d = []
+
+        for idx in sampled_idx0:
+            pts_2d = self.sess.manual_contours.get(idx, None)
+            if pts_2d is None or len(pts_2d) < 2:
+                continue
+
+            pts_uv_px = np.asarray(pts_2d, dtype=np.float32)
+
+            pts_xz_mm = []
+            for (u, v) in pts_uv_px:
+                # simulation mode 下 x/z = 0.1 mm/px
+                x_mm = float(u) * 0.1
+                z_mm = float(self.sess.frame_h - v) * 0.1
+                pts_xz_mm.append([x_mm, z_mm])
+
+            pts_xz_mm = np.asarray(pts_xz_mm, dtype=np.float32)
+
+            contours_2d.append({
+                "frame_idx0": int(idx),
+                "frame_idx1": int(idx + 1),
+                "pts_xz_mm": pts_xz_mm,
+                "pts_uv_px": pts_uv_px,
+                "num_points": int(len(pts_uv_px)),
+                "is_closed": True,
+            })
+
+        mesh_dict = self._mesh_to_eval_dict(self.sess.surface_mesh_mm)
+
+        # y scaling debug info
+        y_scale_to_mm = float(self.cfg.fh_dy_mm_per_frame) / float(self.cfg.y_spacing)
+
+        pred = {
+            "meta": {
+                "source": "python_project",
+                "input_mode": str(self.cfg.input_mode),
+                "frame_stride": int(stride),
+                "num_total_frames": int(n_frames),
+                "sampled_frame_idx0": np.asarray(sampled_idx0, dtype=np.int32),
+                "dx_mm": float(0.1),
+                "dy_mm": float(self.cfg.fh_dy_mm_per_frame),
+                "dz_mm": float(0.1),
+                "y_spacing_display": float(self.cfg.y_spacing),
+                "y_scale_to_mm": float(y_scale_to_mm),
+                "crop_size": int(self.cfg.crop_size),
+                "run_name": str(self.cfg.run_name),
+            },
+            "contours_2d": np.array(contours_2d, dtype=object),
+            "mesh_3d": mesh_dict,
+        }
+
+        return pred
+    
+    def export_pred_eval_mat(self):
+        out_path = self._get_eval_export_path()
+        pred = self._build_pred_eval_export_struct()
+        savemat(out_path, {"pred": pred}, do_compression=True)
+        print(f"[EvalExport] Saved: {out_path}")
+        
     def generate_surface_from_labels(self):
         """
         Re-calculates 3D positions from 2D manual labels and reconstructs the surface.
@@ -1847,7 +2358,45 @@ class VisualizerController:
         - NO Interpolation: Uses only the frames selected by the user.
         """
         self.update_status("Generating aligned surface...")
-        sorted_indices = sorted(self.sess.manual_contours.keys())
+        raw_indices = sorted(self.sess.manual_contours.keys())
+        valid_indices = [
+            idx for idx in raw_indices
+            if len(self.sess.manual_contours.get(idx, [])) >= 3
+        ]
+        segments = list(getattr(self.sess, "scan_direction_segments", []))
+        selected_pass = None
+        if segments:
+            passes = []
+            cur = None
+            for seg in segments:
+                start = int(seg["start"])
+                end = int(seg["end"])
+                direction = str(seg["direction"])
+                if cur is None or cur["direction"] != direction or start != cur["end"]:
+                    if cur is not None:
+                        passes.append(cur)
+                    cur = {"start": start, "end": end, "direction": direction}
+                else:
+                    cur["end"] = end
+            if cur is not None:
+                passes.append(cur)
+
+            candidates = []
+            for scan_pass in passes:
+                start = int(scan_pass["start"])
+                end = int(scan_pass["end"])
+                pass_indices = [idx for idx in valid_indices if start <= idx < end]
+                if len(pass_indices) >= 2:
+                    candidates.append((len(pass_indices), start, end, scan_pass, pass_indices))
+            if candidates:
+                # Use one continuous same-direction scan pass. This avoids stitching forward and reverse passes
+                # into a double-layer surface when the probe scans back over the same anatomy.
+                candidates.sort(key=lambda item: (-item[0], item[1]))
+                _, _, _, selected_pass, sorted_indices = candidates[0]
+            else:
+                sorted_indices = valid_indices
+        else:
+            sorted_indices = valid_indices
         
         if len(sorted_indices) < 2:
             self.update_status("Need at least 2 frames to build a surface.")
@@ -1891,8 +2440,8 @@ class VisualizerController:
         for idx in sorted_indices:
             pts_2d = self.sess.manual_contours[idx]
             if len(pts_2d) < 3: continue
-            
-            y_pos = idx * self.cfg.y_spacing
+
+            y_pos = self._get_y_position_for_frame(idx)
             center = np.array([self.sess.frame_w * 0.5, y_pos, self.sess.frame_h * 0.5], dtype=np.float32)
             beta = self.sess.beta_deg[idx] if (self.sess.beta_deg is not None and idx < len(self.sess.beta_deg)) else 0.0
             gamma = self.sess.gamma_deg[idx] if (self.sess.gamma_deg is not None and idx < len(self.sess.gamma_deg)) else 0.0
@@ -1900,7 +2449,8 @@ class VisualizerController:
             # 2D ROI -> 3D World
             pts_3d = []
             for (u, v) in pts_2d:
-                wx, wy, wz = full_img_to_world_3d(u, v, idx, self.sess.frame_h, self.cfg.y_spacing)
+                wx, wz = self.img_to_world(int(u), int(v), self.sess.frame_h)
+                wy = y_pos
                 pts_3d.append([wx, wy, wz])
             
             # Apply Beta/Gamma rotation
@@ -1951,14 +2501,28 @@ class VisualizerController:
         try:
             self.sess.surface_mesh_px = surf.copy(deep=True)
             mesh_mm = self._build_mm_volume_mesh_from_display_mesh(surf)
+            self.sess.surface_mesh_mm = mesh_mm
             vol_mm3 = self._compute_mesh_volume_mm3(mesh_mm)
             self.sess.surface_volume_mm3 = vol_mm3
             self.sess.surface_volume_ml = vol_mm3 / 1000.0
             
+            if selected_pass is not None:
+                suffix = (
+                    f" from frames {int(selected_pass['start'])}-{int(selected_pass['end']) - 1} "
+                    f"({selected_pass['direction']} pass)"
+                )
+            else:
+                suffix = ""
             self.update_status(
                 f"Surface Aligned. Volume: {vol_mm3:.2f} mm3 ({self.sess.surface_volume_ml:.3f} mL)\n"
-                f"Used {num_frames} frames with {M} aligned pts/ring."
+                f"Used {num_frames} frames with {M} aligned pts/ring{suffix}."
             )
+
+            if bool(getattr(self.cfg, "enable_eval_export", False)):
+                try:
+                    self.export_pred_eval_mat()
+                except Exception as e:
+                    print(f"[EvalExport] Failed: {e}")
         except Exception as e:
             print(f"Volume calculation error: {e}")
             self.update_status("Surface generated, volume calculation failed.")
@@ -1969,13 +2533,26 @@ class VisualizerController:
     def build_3d_view(self):
         """Render stacked image planes + crop planes + contour point cloud/surface."""
         s = self.sess
-        n = len(s.right_frames)
+
+        n = min(len(s.right_frames), len(s.left_frames))
 
         img_x, img_y = s.click_point
         crop_world_x, crop_world_z = self.img_to_world(img_x, img_y, s.frame_h)
         half = self.cfg.crop_size // 2
-        
-        self.update_status(f"Preparing {n} frames...")
+
+        segments = getattr(s, "scan_direction_segments", [])
+        if segments:
+            dir_label = ", ".join(
+                f"{seg['start']}-{seg['end'] - 1}:{seg['direction'][0].upper()}"
+                for seg in segments[:5]
+            )
+            if len(segments) > 5:
+                dir_label += ", ..."
+        else:
+            direction = getattr(s, "scan_direction", "forward")
+            dir_label = "forward (+Y, RIGHT frames)" if direction == "forward" \
+                        else "reverse (-Y, LEFT frames)"
+        self.update_status(f"Preparing {n} frames  [{dir_label}]...")
         self.plotter.render()
 
         all_meshes = []
@@ -1985,8 +2562,8 @@ class VisualizerController:
         # Render every N frames
         stride = int(getattr(self, "render_stride", 5))
         for i in range(0, n, stride):
-            y_pos = i * self.cfg.y_spacing
-            # --- NEW: yellow band border (4-5-6 row) for THIS frame y_pos ---
+            y_pos = self._get_y_position_for_frame(i)
+            # --- yellow band border (4-5-6 row) for THIS frame y_pos ---
             cell = int(self.cfg.crop_size)
             band_z_top = crop_world_z + 0.5 * cell
             band_z_bot = crop_world_z - 0.5 * cell
@@ -2003,7 +2580,7 @@ class VisualizerController:
             band_border_mesh = pv.lines_from_points(band_border_pts)
             # --------------------------------------------------------------
 
-            frame = s.right_frames[i]
+            frame = self._get_display_frame_for_idx(i)
             if frame.ndim == 3 and frame.shape[2] == 4:
                 full_rgba = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGBA)
             else:
@@ -2023,7 +2600,7 @@ class VisualizerController:
                 dtype=np.float32
             )
 
-            crop_frame = s.cropped_right[i]
+            crop_frame = self._get_display_crop_for_idx(i)
             if crop_frame.ndim == 3 and crop_frame.shape[2] == 4:
                 crop_rgba = cv2.cvtColor(crop_frame, cv2.COLOR_BGRA2RGBA)
             else:
@@ -2131,7 +2708,7 @@ class VisualizerController:
 
             })
 
-            contour_pts_2d = s.contour_points_list[i]
+            contour_pts_2d = self._get_display_contour_for_idx(i)
             if contour_pts_2d is not None and len(contour_pts_2d) > 0:
                 pts2d = np.asarray(contour_pts_2d, dtype=np.float32)
 
@@ -2144,7 +2721,8 @@ class VisualizerController:
                 # -----------------------------------------------
 
                 for pt in pts2d:
-                    wx, wy, wz = full_img_to_world_3d(int(pt[0]), int(pt[1]), i, s.frame_h, self.cfg.y_spacing)
+                    wx, wz = self.img_to_world(int(pt[0]), int(pt[1]), s.frame_h)
+                    wy = y_pos
                     all_contour_points.append([wx, wy, wz])
 
 
