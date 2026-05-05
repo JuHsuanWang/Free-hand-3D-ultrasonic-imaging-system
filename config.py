@@ -97,6 +97,7 @@ class AppConfig:
 
     # Scan direction is allowed to change only at coarse segment boundaries.
     scan_direction_segment_frames: int = 100
+    y_heatmap_ignore_tail_frames: int = 50
 
     # --- Out-of-plane rotation (beta/gamma) post-processing ---
     enable_beta_gamma_median_filter: bool = False

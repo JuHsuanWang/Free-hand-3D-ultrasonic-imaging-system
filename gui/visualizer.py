@@ -1029,14 +1029,6 @@ class VisualizerController:
             r2_fwd, r2_rev = float("nan"), float("nan")
             direction = "forward"
 
-        self.sess.scan_direction = direction
-        self.sess.y_heatmap_fwd = H_fwd
-        self.sess.y_best_pairs_fwd = best_fwd
-        self.sess.y_heatmap_rev = H_rev
-        self.sess.y_best_pairs_rev = best_rev
-        self.sess.scan_r2_fwd = r2_fwd
-        self.sess.scan_r2_rev = r2_rev
-
         seg_len = max(1, int(getattr(self.cfg, "scan_direction_segment_frames", 100)))
         segments = []
         per_frame = [direction] * n_frames
@@ -1062,6 +1054,38 @@ class VisualizerController:
             r2 = float("nan") if ss_tot < 1e-12 else float(1.0 - ss_res / ss_tot)
             resid_std = float(np.std(residuals)) if residuals.size > 0 else float("nan")
             return r2, float(a), float(b), resid_std
+
+        ignore_tail = max(0, int(getattr(self.cfg, "y_heatmap_ignore_tail_frames", 50)))
+        valid_ref_end = max(0, n_frames - ignore_tail)
+
+        def _trim_tail_refs(H, best_pairs):
+            trimmed_best = [p for p in best_pairs if int(p[0]) < valid_ref_end]
+            if H is None:
+                return None, trimmed_best
+            H_trim = np.array(H, copy=True)
+            if H_trim.ndim >= 2 and valid_ref_end < H_trim.shape[0]:
+                H_trim[valid_ref_end:, :] = np.nan
+            return H_trim, trimmed_best
+
+        H_fwd, best_fwd = _trim_tail_refs(H_fwd, best_fwd)
+        H_rev, best_rev = _trim_tail_refs(H_rev, best_rev)
+        r2_fwd, _, _, global_std_fwd = _robust_line_fit(best_fwd)
+        r2_rev, _, _, global_std_rev = _robust_line_fit(best_rev)
+        if use_scan_dir:
+            if np.isnan(global_std_fwd) and np.isnan(global_std_rev):
+                direction = "forward"
+            elif np.isnan(global_std_rev) or (not np.isnan(global_std_fwd) and global_std_fwd <= global_std_rev):
+                direction = "forward"
+            else:
+                direction = "reverse"
+
+        self.sess.scan_direction = direction
+        self.sess.y_heatmap_fwd = H_fwd
+        self.sess.y_best_pairs_fwd = best_fwd
+        self.sess.y_heatmap_rev = H_rev
+        self.sess.y_best_pairs_rev = best_rev
+        self.sess.scan_r2_fwd = r2_fwd
+        self.sess.scan_r2_rev = r2_rev
 
         _, global_slope_fwd, global_intercept_fwd, _ = _robust_line_fit(best_fwd)
         _, global_slope_rev, global_intercept_rev, _ = _robust_line_fit(best_rev)
@@ -1157,7 +1181,8 @@ class VisualizerController:
         mode_label = "segmented forward/reverse" if use_scan_dir else "fixed L->R"
         print(
             f"[ScanDir] mode={mode_label}  max_r_ahead={heatmap_max_r_ahead}  "
-            f"direction={direction}  R2_fwd={r2_fwd:.3f}  R2_rev={r2_rev:.3f}"
+            f"ignore_tail_refs={ignore_tail}  direction={direction}  "
+            f"R2_fwd={r2_fwd:.3f}  R2_rev={r2_rev:.3f}"
         )
         for seg in segments:
             print(
@@ -1196,6 +1221,13 @@ class VisualizerController:
         segments = list(getattr(s, "scan_direction_segments", []))
         seg_len = int(getattr(self.cfg, "scan_direction_segment_frames", 100))
         use_scan_dir = bool(getattr(self.cfg, "enable_scan_direction_detection", True))
+        ref_count = 0
+        if H_fwd is not None and H_fwd.ndim >= 2:
+            ref_count = int(H_fwd.shape[0])
+        elif H_rev is not None and H_rev.ndim >= 2:
+            ref_count = int(H_rev.shape[0])
+        ignore_tail = max(0, int(getattr(self.cfg, "y_heatmap_ignore_tail_frames", 50)))
+        valid_ref_end = max(0, ref_count - ignore_tail)
 
         CLR_FWD_SEL = "#1a8a1a"
         CLR_REV_SEL = "#1a1aaa"
@@ -1230,11 +1262,14 @@ class VisualizerController:
                 return
             for seg in segments:
                 start = int(seg["start"])
-                end = int(seg["end"])
+                end = min(int(seg["end"]), valid_ref_end)
+                if start >= valid_ref_end or end <= start:
+                    continue
                 color = CLR_FWD_SEL if seg["direction"] == "forward" else CLR_REV_SEL
                 ax.axvspan(start, end - 1, color=color, alpha=0.055, zorder=1)
                 ax.axvline(start, color=color, linewidth=1.0, alpha=0.45, zorder=7)
-            ax.axvline(int(segments[-1]["end"]) - 1, color="#444444", linewidth=0.8, alpha=0.35, zorder=7)
+            if valid_ref_end > 0:
+                ax.axvline(valid_ref_end - 1, color="#444444", linewidth=0.8, alpha=0.35, zorder=7)
 
         # ── inner helper ──────────────────────────────────────────────────
         def _draw_panel(ax, H, best_pairs, xlabel, ylabel):
@@ -1252,6 +1287,8 @@ class VisualizerController:
                            cmap="gray", origin="lower", aspect=aspect,
                            vmin=heat_vmin, vmax=heat_vmax)
             ax.set_ylim(0, H.shape[0] - 1)
+            if valid_ref_end > 0:
+                ax.set_xlim(0, valid_ref_end - 1)
             ax.margins(y=0)
 
             if len(best_pairs) >= 5:
