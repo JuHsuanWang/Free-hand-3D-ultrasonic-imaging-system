@@ -1008,7 +1008,7 @@ class VisualizerController:
         )
 
         n_frames = min(int(len(self.sess.band_left)), int(len(self.sess.band_right)))
-        heatmap_max_r_ahead = n_frames if self.cfg.input_mode == "live" else 100
+        heatmap_max_r_ahead = 100
         use_scan_dir = bool(getattr(self.cfg, "enable_scan_direction_detection", True))
         if use_scan_dir:
             direction, H_fwd, best_fwd, H_rev, best_rev, r2_fwd, r2_rev = \

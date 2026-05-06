@@ -57,21 +57,21 @@ class CaptureThread(QtCore.QThread):
                 if not line: continue
                 
                 # Check keywords in the output to update the GUI status
-                if "read default parameter values" in line:
+                if "start scan" in line or "One shot mode" in line:
+                    self.update_signal.emit("CAPTURING NOW (Frame 0). Please move the probe.")
+                elif "read default parameter values" in line:
                     self.update_signal.emit("Parameters loaded. Applying to Prodigy...")
-                elif "start scan" in line or "One shot mode" in line:
-                    self.update_signal.emit("🟢 CAPTURING NOW! Please move the probe.")
                 elif "scan done" in line:
                     self.update_signal.emit("Scan finished. Finalizing video files...")
                 else:
-                    m = re.search(r"Frame#\s*(\d+)", line)
+                    m = re.search(r"Frame\s*#?\s*(\d+)", line, flags=re.IGNORECASE)
                     if m:
                         frame_idx = int(m.group(1))
                         seg_idx = max(1, (frame_idx - 1) // 100 + 1)
                         seg_start = (seg_idx - 1) * 100 + 1
                         seg_end = seg_idx * 100
                         self.update_signal.emit(
-                            f"CAPTURING NOW: Frame {frame_idx} "
+                            f"CAPTURING NOW (Frame {frame_idx}) "
                             f"(direction segment {seg_idx}: frames {seg_start}-{seg_end})"
                         )
                 
