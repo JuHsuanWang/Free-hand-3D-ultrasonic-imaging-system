@@ -9,6 +9,7 @@ import pyvista as pv
 from concurrent.futures import ThreadPoolExecutor
 from scipy.io import savemat
 
+from core.loader import VideoLoader
 from algorithms.geometry import (
     img_to_world_xz,
     world_to_img_xz,
@@ -74,6 +75,9 @@ class VisualizerController:
         self.temp_label_points_actor = None
         self._temp_polyline = None
         self._temp_points = None
+        self._label_click_tracking_enabled = False
+        self._label_undo_key_enabled = False
+        self._label2d_frame_idx = None
 
         self.existing_label_actors = {}              # {frame_idx: pv.Actor}
         # --- NEW: 2D labeling view actors (single plane) ---
@@ -471,18 +475,45 @@ class VisualizerController:
         self.show_cropped_frame_for_selection()
 
     def apply_roi_crop(self):
-        """Apply ROI crop to all frames (in-memory)."""
+        """Apply ROI crop to all frames, decoding videos directly into ROI when possible."""
         x1, y1 = self.sess.roi_pt1
         x2, y2 = self.sess.roi_pt2
 
         x1, x2 = min(x1, x2), max(x1, x2)
         y1, y2 = min(y1, y2), max(y1, y2)
 
-        self.sess.left_frames = self.sess.left_frames_original[:, y1:y2, x1:x2, :].copy()
-        self.sess.right_frames = self.sess.right_frames_original[:, y1:y2, x1:x2, :].copy()
+        can_decode_roi = (
+            self.sess.input_mode in ("video", "live")
+            and bool(getattr(self.sess, "left_source_path", ""))
+            and bool(getattr(self.sess, "right_source_path", ""))
+            and os.path.isfile(self.sess.left_source_path)
+            and os.path.isfile(self.sess.right_source_path)
+        )
+        if can_decode_roi:
+            self.update_status("Decoding ROI frames from videos...")
+            self.plotter.render()
+            roi = (x1, y1, x2, y2)
+
+            def _load_roi(path: str) -> np.ndarray:
+                return VideoLoader(output_fps=self.cfg.output_fps).extract_roi_frames(path, roi)
+
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                fut_left = ex.submit(_load_roi, self.sess.left_source_path)
+                fut_right = ex.submit(_load_roi, self.sess.right_source_path)
+                self.sess.left_frames = fut_left.result()
+                self.sess.right_frames = fut_right.result()
+        else:
+            self.sess.left_frames = self.sess.left_frames_original[:, y1:y2, x1:x2, :].copy()
+            self.sess.right_frames = self.sess.right_frames_original[:, y1:y2, x1:x2, :].copy()
+
+        if len(self.sess.left_frames) != len(self.sess.right_frames):
+            raise ValueError(
+                f"Left/right ROI frame count mismatch: "
+                f"{len(self.sess.left_frames)} vs {len(self.sess.right_frames)}"
+            )
 
         self.sess.ensure_roi_dims()
-        print(f"  ROI cropped to: {self.sess.frame_w}x{self.sess.frame_h}")
+        print(f"  ROI cropped to: {self.sess.frame_w}x{self.sess.frame_h} ({len(self.sess.right_frames)} frames)")
 
     # -------------------------
     # Phase 2: Crop center selection
@@ -1813,6 +1844,16 @@ class VisualizerController:
             return
 
         idx = int(max(0, min(frame_idx, len(self.sess.right_frames) - 1)))
+        if (
+            self.label2d_full_actor is not None
+            and self._label2d_frame_idx == idx
+            and self.is_labeling
+        ):
+            self.active_frame_idx = idx
+            self._redraw_current_temp_label_2d(render_now=False)
+            self.plotter.render()
+            return
+
         self.active_frame_idx = idx
 
         # clean view
@@ -1829,6 +1870,7 @@ class VisualizerController:
             try: self.plotter.remove_actor(self.label2d_full_actor)
             except Exception: pass
             self.label2d_full_actor = None
+            self._label2d_frame_idx = None
         
         # --- Build a single ROI plane at y=0 (full cyan ROI) ---
         frame = self._get_display_frame_for_idx(idx)
@@ -1856,6 +1898,7 @@ class VisualizerController:
 
         # OPAQUE crop
         self.label2d_full_actor = self.plotter.add_mesh(mesh, texture=tex, opacity=1.0)
+        self._label2d_frame_idx = idx
 
         # --- Camera: face the plane (front view) + reset ---
         center_x = float(w) * 0.5
@@ -1870,10 +1913,13 @@ class VisualizerController:
         except Exception:
             pass
 
-        # IMPORTANT: use track_click_position (no point picking)
-        self.plotter.track_click_position(callback=self.on_label_click_2d, side="left")
+        # IMPORTANT: register once. Re-registering on every frame switch stacks callbacks
+        # and makes one click do duplicate work after long labeling sessions.
+        if not self._label_click_tracking_enabled:
+            self.plotter.track_click_position(callback=self.on_label_click_2d, side="left")
+            self._label_click_tracking_enabled = True
 
-        self._redraw_current_temp_label_2d()
+        self._redraw_current_temp_label_2d(render_now=False)
         self.plotter.render()
 
     def _exit_2d_label_view(self):
@@ -1884,6 +1930,7 @@ class VisualizerController:
             except Exception:
                 pass
             self.label2d_full_actor = None
+            self._label2d_frame_idx = None
 
         # restore 3D
         self._restore_3d_actors_after_labeling()
@@ -1941,10 +1988,12 @@ class VisualizerController:
         )
 
         # bind undo
-        try:
-            self.plotter.add_key_event("z", self.undo_last_point)
-        except Exception:
-            pass
+        if not self._label_undo_key_enabled:
+            try:
+                self.plotter.add_key_event("z", self.undo_last_point)
+                self._label_undo_key_enabled = True
+            except Exception:
+                pass
 
         # show 2D ROI plane for this frame
         self._enter_2d_label_view(self.active_frame_idx)
@@ -1995,6 +2044,9 @@ class VisualizerController:
             return
 
         idx = max(0, min(n - 1, idx))
+        if self.is_labeling and idx == self.active_frame_idx and self.label2d_full_actor is not None:
+            return
+
         self.active_frame_idx = idx
 
         self.update_status(
@@ -2035,11 +2087,13 @@ class VisualizerController:
                 self._redraw_current_temp_label()
 
 
-    def _redraw_current_temp_label_2d(self):
+    def _redraw_current_temp_label_2d(self, render_now: bool = True):
         """
         Fast 2D redraw:
         - DO NOT remove/add actors (avoid flicker)
         - Update mapper input in-place
+        - Use lightweight points/lines. Tube and sphere glyphs are expensive when
+          a contour grows to hundreds of points.
         """
         idx = int(self.active_frame_idx)
         pts2d = self.sess.manual_contours.get(idx, None)
@@ -2047,17 +2101,19 @@ class VisualizerController:
             # hide actors if no points
             self._set_actor_visibility(self.temp_label_actor, False)
             self._set_actor_visibility(self.temp_label_points_actor, False)
+            if render_now:
+                self.plotter.render()
             return
 
         crop_h = int(self.sess.frame_h)
         y_eps = -0.5
 
         # build 3D points on y=y_eps plane
-        pts = np.empty((len(pts2d), 3), dtype=np.float32)
-        for k, (u, v) in enumerate(pts2d):
-            x = float(u)
-            z = float(crop_h) - float(v)
-            pts[k] = (x, y_eps, z)
+        pts2d_np = np.asarray(pts2d, dtype=np.float32)
+        pts = np.empty((pts2d_np.shape[0], 3), dtype=np.float32)
+        pts[:, 0] = pts2d_np[:, 0]
+        pts[:, 1] = y_eps
+        pts[:, 2] = float(crop_h) - pts2d_np[:, 1]
 
         # --- points actor (immediate feedback even with 1 point) ---
         cloud = pv.PolyData(pts)
@@ -2065,8 +2121,8 @@ class VisualizerController:
             self.temp_label_points_actor = self.plotter.add_mesh(
                 cloud,
                 color="lime",
-                point_size=10,
-                render_points_as_spheres=True,
+                point_size=7,
+                render_points_as_spheres=False,
                 lighting=False,
             )
         else:
@@ -2080,13 +2136,14 @@ class VisualizerController:
                 except Exception:
                     pass
                 self.temp_label_points_actor = self.plotter.add_mesh(
-                    cloud, color="lime", point_size=10, render_points_as_spheres=True, lighting=False
+                    cloud, color="lime", point_size=7, render_points_as_spheres=False, lighting=False
                 )
 
         # --- polyline actor (only when >=2 pts) ---
         if len(pts) < 2:
             self._set_actor_visibility(self.temp_label_actor, False)
-            self.plotter.render()
+            if render_now:
+                self.plotter.render()
             return
 
         poly = pv.lines_from_points(pts, close=False)
@@ -2094,8 +2151,8 @@ class VisualizerController:
             self.temp_label_actor = self.plotter.add_mesh(
                 poly,
                 color="lime",
-                line_width=5,
-                render_lines_as_tubes=True,
+                line_width=3,
+                render_lines_as_tubes=False,
                 lighting=False,
             )
         else:
@@ -2108,10 +2165,11 @@ class VisualizerController:
                 except Exception:
                     pass
                 self.temp_label_actor = self.plotter.add_mesh(
-                    poly, color="lime", line_width=5, render_lines_as_tubes=True, lighting=False
+                    poly, color="lime", line_width=3, render_lines_as_tubes=False, lighting=False
                 )
 
-        self.plotter.render()
+        if render_now:
+            self.plotter.render()
 
 
     def _redraw_current_temp_label(self):
@@ -2283,7 +2341,12 @@ class VisualizerController:
                 ])
         print(f"[TrackerLikeExport] Saved: {out_path}")
 
-    def _mesh_to_eval_dict(self, mesh_mm: pv.PolyData) -> dict:
+    def _mesh_to_eval_dict(
+        self,
+        mesh_mm: pv.PolyData,
+        y_origin_mm: float = 0.0,
+        xyz_scale: float = 1.0,
+    ) -> dict:
         if mesh_mm is None or mesh_mm.n_points == 0:
             return {
                 "vertices_mm": np.zeros((0, 3), dtype=np.float32),
@@ -2295,7 +2358,9 @@ class VisualizerController:
                 "volume_ml": float("nan"),
             }
 
-        vertices = np.asarray(mesh_mm.points, dtype=np.float32)
+        vertices = np.asarray(mesh_mm.points, dtype=np.float32).copy()
+        vertices *= float(xyz_scale)
+        vertices[:, 1] -= float(y_origin_mm)
 
         faces_raw = np.asarray(mesh_mm.faces)
         if faces_raw.size == 0:
@@ -2322,14 +2387,77 @@ class VisualizerController:
             "volume_mm3": float(self.sess.surface_volume_mm3) if self.sess.surface_volume_mm3 is not None else float("nan"),
             "volume_ml": float(self.sess.surface_volume_ml) if self.sess.surface_volume_ml is not None else float("nan"),
         }
+
+    def _get_eval_xz_mm_per_px(self) -> float:
+        if self.cfg.input_mode == "simulation":
+            return 0.1
+
+        depth_mm_per_px = float(getattr(self.sess, "depth_mm_per_px", 0.0))
+        if depth_mm_per_px > 0.0:
+            return depth_mm_per_px
+
+        return float(getattr(self.cfg, "dx_mm", 0.1))
+
+    def _get_eval_y_origin_frame_idx0(self, sampled_idx0: list[int], n_frames: int) -> float:
+        forced_idx = int(getattr(self.cfg, "eval_y_origin_frame_idx0", -1))
+        if forced_idx >= 0:
+            return float(forced_idx)
+
+        mode = str(getattr(self.cfg, "eval_y_origin_mode", "labeled_mid")).lower().strip()
+        if mode == "frame0":
+            return 0.0
+        if mode == "scan_mid":
+            return 0.5 * float(max(0, n_frames - 1))
+
+        if sampled_idx0:
+            return 0.5 * (float(min(sampled_idx0)) + float(max(sampled_idx0)))
+
+        return 0.5 * float(max(0, n_frames - 1))
     
     def _build_pred_eval_export_struct(self) -> dict:
         stride = int(getattr(self.cfg, "eval_export_stride", 10))
         n_frames = len(self.sess.right_frames) if self.sess.right_frames is not None else 0
 
-        sampled_idx0 = list(range(0, n_frames, stride))
+        sampled_idx0 = [
+            int(idx)
+            for idx in sorted(self.sess.manual_contours.keys())
+            if 0 <= int(idx) < n_frames and len(self.sess.manual_contours.get(idx, [])) >= 2
+        ]
 
         contours_2d = []
+        export_space = str(getattr(self.cfg, "eval_export_space", "display")).lower().strip()
+        if export_space not in ("display", "display_scaled_mm", "physical_mm"):
+            export_space = "display_scaled_mm"
+
+        if export_space == "display":
+            xz_scale = 1.0
+            y_scale = 1.0
+            mesh_xyz_scale = 1.0
+            mesh_for_export = self.sess.surface_mesh_px
+            coordinate_units = "display"
+            dy_export = float(self.cfg.y_spacing)
+        elif export_space == "display_scaled_mm":
+            xz_scale = self._get_eval_xz_mm_per_px()
+            y_scale = self._get_eval_xz_mm_per_px()
+            mesh_xyz_scale = self._get_eval_xz_mm_per_px()
+            mesh_for_export = self.sess.surface_mesh_px
+            coordinate_units = "mm"
+            dy_export = float(self.cfg.y_spacing) * float(mesh_xyz_scale)
+        else:
+            xz_scale = self._get_eval_xz_mm_per_px()
+            y_scale = float(self.cfg.fh_dy_mm_per_frame) / float(self.cfg.y_spacing)
+            mesh_xyz_scale = 1.0
+            mesh_for_export = self.sess.surface_mesh_mm
+            coordinate_units = "mm"
+            dy_export = float(self.cfg.fh_dy_mm_per_frame)
+
+        y_origin_frame_idx0 = self._get_eval_y_origin_frame_idx0(sampled_idx0, n_frames)
+        y_origin_display = self._get_y_position_for_frame(int(round(y_origin_frame_idx0)))
+        if sampled_idx0 and not float(y_origin_frame_idx0).is_integer():
+            y0 = self._get_y_position_for_frame(int(np.floor(y_origin_frame_idx0)))
+            y1 = self._get_y_position_for_frame(int(np.ceil(y_origin_frame_idx0)))
+            y_origin_display = 0.5 * (float(y0) + float(y1))
+        y_origin_mm = float(y_origin_display) * y_scale
 
         for idx in sampled_idx0:
             pts_2d = self.sess.manual_contours.get(idx, None)
@@ -2341,25 +2469,28 @@ class VisualizerController:
             pts_xz_mm = []
             for (u, v) in pts_uv_px:
                 # simulation mode 下 x/z = 0.1 mm/px
-                x_mm = float(u) * 0.1
-                z_mm = float(self.sess.frame_h - v) * 0.1
+                x_mm = float(u) * xz_scale
+                z_mm = float(self.sess.frame_h - v) * xz_scale
                 pts_xz_mm.append([x_mm, z_mm])
 
             pts_xz_mm = np.asarray(pts_xz_mm, dtype=np.float32)
+            y_mm = float(self._get_y_position_for_frame(idx)) * y_scale - y_origin_mm
 
             contours_2d.append({
                 "frame_idx0": int(idx),
                 "frame_idx1": int(idx + 1),
+                "y_mm": float(y_mm),
                 "pts_xz_mm": pts_xz_mm,
                 "pts_uv_px": pts_uv_px,
                 "num_points": int(len(pts_uv_px)),
                 "is_closed": True,
             })
 
-        mesh_dict = self._mesh_to_eval_dict(self.sess.surface_mesh_mm)
-
-        # y scaling debug info
-        y_scale_to_mm = float(self.cfg.fh_dy_mm_per_frame) / float(self.cfg.y_spacing)
+        mesh_dict = self._mesh_to_eval_dict(
+            mesh_for_export,
+            y_origin_mm=y_origin_mm,
+            xyz_scale=mesh_xyz_scale,
+        )
 
         pred = {
             "meta": {
@@ -2368,13 +2499,26 @@ class VisualizerController:
                 "frame_stride": int(stride),
                 "num_total_frames": int(n_frames),
                 "sampled_frame_idx0": np.asarray(sampled_idx0, dtype=np.int32),
-                "dx_mm": float(0.1),
-                "dy_mm": float(self.cfg.fh_dy_mm_per_frame),
-                "dz_mm": float(0.1),
+                "export_space": str(export_space),
+                "coordinate_units": str(coordinate_units),
+                "dx_mm": float(xz_scale),
+                "dy_mm": float(dy_export),
+                "dz_mm": float(xz_scale),
+                "xz_mm_per_px": float(xz_scale),
+                "mesh_xyz_scale": float(mesh_xyz_scale),
                 "y_spacing_display": float(self.cfg.y_spacing),
-                "y_scale_to_mm": float(y_scale_to_mm),
+                "y_scale_to_mm": float(y_scale),
+                "y_origin_mode": str(getattr(self.cfg, "eval_y_origin_mode", "labeled_mid")),
+                "y_origin_frame_idx0": float(y_origin_frame_idx0),
+                "y_origin_mm": float(y_origin_mm),
                 "crop_size": int(self.cfg.crop_size),
                 "run_name": str(self.cfg.run_name),
+                "coordinate_system": (
+                    "display: x=u, z=frame_h-v, y=display_y-y_origin; "
+                    "display_scaled_mm: display coordinates uniformly scaled by mesh_xyz_scale; "
+                    "physical_mm: x=u*xz_mm_per_px, z=(frame_h-v)*xz_mm_per_px, "
+                    "y=display_y*y_scale_to_mm-y_origin"
+                ),
             },
             "contours_2d": np.array(contours_2d, dtype=object),
             "mesh_3d": mesh_dict,
@@ -2384,9 +2528,11 @@ class VisualizerController:
     
     def export_pred_eval_mat(self):
         out_path = self._get_eval_export_path()
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
         pred = self._build_pred_eval_export_struct()
         savemat(out_path, {"pred": pred}, do_compression=True)
         print(f"[EvalExport] Saved: {out_path}")
+        return out_path
         
     def generate_surface_from_labels(self):
         """
@@ -2534,6 +2680,10 @@ class VisualizerController:
             surf, color="lime", opacity=0.5, smooth_shading=True
         )
 
+        export_path = None
+        export_error = None
+        status_text = "Surface generated."
+
         # 5. Volume Calculation
         try:
             self.sess.surface_mesh_px = surf.copy(deep=True)
@@ -2550,19 +2700,31 @@ class VisualizerController:
                 )
             else:
                 suffix = ""
-            self.update_status(
+            status_text = (
                 f"Surface Aligned. Volume: {vol_mm3:.2f} mm3 ({self.sess.surface_volume_ml:.3f} mL)\n"
                 f"Used {num_frames} frames with {M} aligned pts/ring{suffix}."
             )
-
-            if bool(getattr(self.cfg, "enable_eval_export", False)):
-                try:
-                    self.export_pred_eval_mat()
-                except Exception as e:
-                    print(f"[EvalExport] Failed: {e}")
+            self.update_status(status_text)
         except Exception as e:
             print(f"Volume calculation error: {e}")
-            self.update_status("Surface generated, volume calculation failed.")
+            status_text = "Surface generated, volume calculation failed."
+            self.update_status(status_text)
+
+        if bool(getattr(self.cfg, "enable_eval_export", False)):
+            try:
+                if self.sess.surface_mesh_px is None:
+                    self.sess.surface_mesh_px = surf.copy(deep=True)
+                if self.sess.surface_mesh_mm is None:
+                    self.sess.surface_mesh_mm = self._build_mm_volume_mesh_from_display_mesh(surf)
+                export_path = self.export_pred_eval_mat()
+            except Exception as e:
+                export_error = e
+                print(f"[EvalExport] Failed: {e}")
+
+        if export_path:
+            self.update_status(f"{status_text}\nEval export: {export_path}")
+        elif export_error is not None:
+            self.update_status(f"{status_text}\nEval export failed: {export_error}")
 
         self.plotter.render()
 

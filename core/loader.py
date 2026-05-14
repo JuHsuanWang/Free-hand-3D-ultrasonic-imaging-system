@@ -48,6 +48,75 @@ class VideoLoader:
 
         return self._extract_frames_opencv(video_path)
 
+    def get_video_info(self, video_path: str) -> dict:
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video not found: {video_path}")
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Cannot open: {video_path}")
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        duration = float(total_frames) / fps if fps > 0 else 0.0
+        sample_count = max(1, int(duration * self.output_fps)) if total_frames > 0 else 0
+        return {
+            "total_frames": total_frames,
+            "fps": fps,
+            "width": width,
+            "height": height,
+            "sample_count": sample_count,
+        }
+
+    def extract_first_frame(self, video_path: str) -> np.ndarray:
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video not found: {video_path}")
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Cannot open: {video_path}")
+        ret, frame = cap.read()
+        cap.release()
+        if not ret or frame is None:
+            raise ValueError(f"Failed to read first frame: {video_path}")
+        return frame
+
+    def extract_roi_frames(self, video_path: str, roi_xyxy: tuple[int, int, int, int]) -> np.ndarray:
+        """Extract sampled frames and keep only ROI, avoiding full-video RAM use."""
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video not found: {video_path}")
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Cannot open: {video_path}")
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        duration = total_frames / fps if fps > 0 else 0.0
+        target_count = max(1, int(duration * self.output_fps))
+        indices = np.linspace(0, max(0, total_frames - 1), target_count, dtype=int)
+        indices = np.unique(indices)
+
+        x1, y1, x2, y2 = [int(v) for v in roi_xyxy]
+        x1 = max(0, min(width, x1))
+        x2 = max(0, min(width, x2))
+        y1 = max(0, min(height, y1))
+        y2 = max(0, min(height, y2))
+        if x2 <= x1 or y2 <= y1:
+            cap.release()
+            raise ValueError(f"Invalid ROI: {(x1, y1, x2, y2)}")
+
+        print(f"Loading ROI from {video_path}... ({len(indices)} frames, ROI {x2 - x1}x{y2 - y1})")
+        frames = (
+            self._read_dense_sample_roi(cap, indices, x1, y1, x2, y2)
+            if self._should_read_dense(total_frames, len(indices))
+            else self._read_sparse_sample_roi(cap, indices, x1, y1, x2, y2)
+        )
+        cap.release()
+        return np.asarray(frames, dtype=np.uint8)
+
     def _extract_frames_decord(self, video_path: str) -> np.ndarray:
         from decord import VideoReader, cpu
 
@@ -135,6 +204,45 @@ class VideoLoader:
                 break
             if frame_idx in targets:
                 frames.append(frame)
+            frame_idx += 1
+        return frames
+
+    @staticmethod
+    def _read_sparse_sample_roi(cap: cv2.VideoCapture, indices: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> list:
+        frames = []
+        last_pos = -1
+        for idx in indices:
+            if idx != last_pos + 1:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+
+            ret, frame = cap.read()
+            if not ret:
+                ok = False
+                for _ in range(3):
+                    ret2, frame2 = cap.read()
+                    if ret2:
+                        frame = frame2
+                        ok = True
+                        break
+                if not ok:
+                    break
+
+            frames.append(frame[y1:y2, x1:x2, :].copy())
+            last_pos = int(idx)
+        return frames
+
+    @staticmethod
+    def _read_dense_sample_roi(cap: cv2.VideoCapture, indices: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> list:
+        frames = []
+        targets = set(int(v) for v in indices)
+        max_idx = int(indices[-1]) if len(indices) else -1
+        frame_idx = 0
+        while frame_idx <= max_idx:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_idx in targets:
+                frames.append(frame[y1:y2, x1:x2, :].copy())
             frame_idx += 1
         return frames
 

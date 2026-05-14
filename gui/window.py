@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import sys
+import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from PyQt5.QtWidgets import QFileDialog, QMessageBox
 from core.loader import VideoLoader, ImageSequenceLoader
@@ -378,7 +379,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QMessageBox.warning(self, "Error", "Video files not found!")
             return
 
-        self.ctrl.update_status("Extracting frames from videos... please wait.")
+        self.ctrl.update_status("Loading video preview... full frames will decode after ROI selection.")
         QtWidgets.QApplication.processEvents()
 
         try:
@@ -388,27 +389,35 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sess.left_source_path = left_path
             self.sess.right_source_path = right_path
 
-            def _load_one(path: str) -> object:
-                return VideoLoader(output_fps=self.cfg.output_fps).extract_frames(path)
-
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                fut_left = ex.submit(_load_one, left_path)
-                fut_right = ex.submit(_load_one, right_path)
-                self.sess.left_frames_original = fut_left.result()
-                self.sess.right_frames_original = fut_right.result()
-
-            if len(self.sess.left_frames_original) != len(self.sess.right_frames_original):
+            loader = VideoLoader(output_fps=self.cfg.output_fps)
+            info_left = loader.get_video_info(left_path)
+            info_right = loader.get_video_info(right_path)
+            if info_left["sample_count"] != info_right["sample_count"]:
                 raise ValueError(
                     f"Left/right frame count mismatch: "
-                    f"{len(self.sess.left_frames_original)} vs {len(self.sess.right_frames_original)}"
+                    f"{info_left['sample_count']} vs {info_right['sample_count']}"
                 )
+            if (info_left["width"], info_left["height"]) != (info_right["width"], info_right["height"]):
+                raise ValueError(
+                    f"Left/right video size mismatch: "
+                    f"{info_left['width']}x{info_left['height']} vs {info_right['width']}x{info_right['height']}"
+                )
+
+            def _load_first(path: str) -> object:
+                return VideoLoader(output_fps=self.cfg.output_fps).extract_first_frame(path)
+
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                fut_left = ex.submit(_load_first, left_path)
+                fut_right = ex.submit(_load_first, right_path)
+                self.sess.left_frames_original = np.asarray([fut_left.result()], dtype=np.uint8)
+                self.sess.right_frames_original = np.asarray([fut_right.result()], dtype=np.uint8)
 
             self.sess.ensure_original_dims()
             self.ctrl.build_initial_scene()
 
             self.ctrl.update_status(
-                f"Loaded {len(self.sess.right_frames_original)} frames "
-                f"from {self.cfg.input_mode} mode."
+                f"Loaded video preview from {self.cfg.input_mode} mode.\n"
+                f"{info_right['sample_count']} sampled frames will decode after ROI selection."
             )
 
         except Exception as e:
