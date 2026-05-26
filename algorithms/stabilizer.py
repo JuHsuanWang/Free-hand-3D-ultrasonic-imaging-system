@@ -235,22 +235,14 @@ class SequenceStabilizer:
         click_point_xy: Tuple[int, int],
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Convert BGR -> BGRA (adds alpha), then stabilize frames in-place.
-        Returns (right_frames_bgra, left_frames_bgra).
+        Stabilize frames in-place.
+        Returns the same channel layout as the input frames.
         Also optionally saves debug images R_XXXX_dbg.png with EXACT third-code style.
         """
         n = len(right_frames)
         transforms = []  # list of dict: {"i": i, "theta_rad":..., "tx_px":..., "tz_px":...}
         if n < 2:
             return right_frames, left_frames
-
-        # Add alpha channel for transparent padding
-        h, w = right_frames[0].shape[:2]
-        alpha = np.full((n, h, w, 1), 255, dtype=np.uint8)
-        if right_frames.shape[-1] == 3:
-            right_frames = np.concatenate([right_frames, alpha], axis=3)
-        if left_frames.shape[-1] == 3:
-            left_frames = np.concatenate([left_frames, alpha], axis=3)
 
         # Debug dir
         if self.cfg.save_debug and self.cfg.debug_out_dir:

@@ -36,7 +36,7 @@ class AppConfig:
     #video_y_spacing: float = 5.4
     video_y_spacing: float = 3.4
     #video_fh_dy_mm_per_frame: float = 0.1950
-    video_fh_dy_mm_per_frame: float = 0.16
+    video_fh_dy_mm_per_frame: float = 0.11
     video_enable_stabilization: bool = True
     video_stab_win: int = 16
     video_stab_search: int = 4
@@ -99,6 +99,7 @@ class AppConfig:
 
     # Scan direction is allowed to change only at coarse segment boundaries.
     scan_direction_segment_frames: int = 100
+    y_heatmap_max_r_ahead: int = 50
     y_heatmap_ignore_tail_frames: int = 50
 
     # --- Out-of-plane rotation (beta/gamma) post-processing ---
@@ -107,6 +108,11 @@ class AppConfig:
 
     crop_top_frac: float = 0.25
     enable_crop_top: bool = True
+
+    # --- Surface post-processing ---
+    enable_surface_smoothing: bool = True
+    surface_smoothing_iterations: int = 30
+    surface_smoothing_relaxation: float = 0.01
 
     # --- Freehand pose export in EM tracker-like CSV format ---
     enable_tracker_like_export: bool = False

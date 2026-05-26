@@ -306,7 +306,7 @@ def compute_lr_heatmap_like_matlab(
     cropped_left: np.ndarray,
     cropped_right: np.ndarray,
     cfg: Optional[OutOfPlaneConfig] = None,
-    max_r_ahead: int = 100,
+    max_r_ahead: int = 50,
     frame_stride: int = 1,
 ) -> Tuple[np.ndarray, List[Tuple[int, int, float]]]:
     """
@@ -370,7 +370,7 @@ def compute_scan_direction_heatmaps(
     cropped_left: np.ndarray,
     cropped_right: np.ndarray,
     cfg: Optional[OutOfPlaneConfig] = None,
-    max_r_ahead: int = 100,
+    max_r_ahead: int = 50,
     frame_stride: int = 1,
 ) -> Tuple[str, np.ndarray, List, np.ndarray, List, float, float]:
     """

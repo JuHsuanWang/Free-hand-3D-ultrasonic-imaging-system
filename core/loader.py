@@ -1,5 +1,6 @@
 # core/loader.py
 import os
+import tempfile
 import cv2
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
@@ -109,13 +110,25 @@ class VideoLoader:
             raise ValueError(f"Invalid ROI: {(x1, y1, x2, y2)}")
 
         print(f"Loading ROI from {video_path}... ({len(indices)} frames, ROI {x2 - x1}x{y2 - y1})")
-        frames = (
-            self._read_dense_sample_roi(cap, indices, x1, y1, x2, y2)
+        out = self._allocate_frame_array((len(indices), y2 - y1, x2 - x1, 3))
+        count = (
+            self._read_dense_sample_roi_into(cap, indices, x1, y1, x2, y2, out)
             if self._should_read_dense(total_frames, len(indices))
-            else self._read_sparse_sample_roi(cap, indices, x1, y1, x2, y2)
+            else self._read_sparse_sample_roi_into(cap, indices, x1, y1, x2, y2, out)
         )
         cap.release()
-        return np.asarray(frames, dtype=np.uint8)
+        return out[:count]
+
+    @staticmethod
+    def _allocate_frame_array(shape: tuple[int, int, int, int]) -> np.ndarray:
+        try:
+            return np.empty(shape, dtype=np.uint8)
+        except MemoryError:
+            fd, path = tempfile.mkstemp(prefix="freehand3d_roi_", suffix=".dat")
+            os.close(fd)
+            size_gib = float(np.prod(shape, dtype=np.float64)) / (1024.0 ** 3)
+            print(f"  RAM allocation failed for ROI ({size_gib:.2f} GiB); using disk cache: {path}")
+            return np.memmap(path, dtype=np.uint8, mode="w+", shape=shape)
 
     def _extract_frames_decord(self, video_path: str) -> np.ndarray:
         from decord import VideoReader, cpu
@@ -245,6 +258,63 @@ class VideoLoader:
                 frames.append(frame[y1:y2, x1:x2, :].copy())
             frame_idx += 1
         return frames
+
+    @staticmethod
+    def _read_sparse_sample_roi_into(
+        cap: cv2.VideoCapture,
+        indices: np.ndarray,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        out: np.ndarray,
+    ) -> int:
+        count = 0
+        last_pos = -1
+        for idx in indices:
+            if idx != last_pos + 1:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+
+            ret, frame = cap.read()
+            if not ret:
+                ok = False
+                for _ in range(3):
+                    ret2, frame2 = cap.read()
+                    if ret2:
+                        frame = frame2
+                        ok = True
+                        break
+                if not ok:
+                    break
+
+            out[count] = frame[y1:y2, x1:x2, :]
+            count += 1
+            last_pos = int(idx)
+        return count
+
+    @staticmethod
+    def _read_dense_sample_roi_into(
+        cap: cv2.VideoCapture,
+        indices: np.ndarray,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        out: np.ndarray,
+    ) -> int:
+        count = 0
+        targets = set(int(v) for v in indices)
+        max_idx = int(indices[-1]) if len(indices) else -1
+        frame_idx = 0
+        while frame_idx <= max_idx:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_idx in targets:
+                out[count] = frame[y1:y2, x1:x2, :]
+                count += 1
+            frame_idx += 1
+        return count
 
 class ImageSequenceLoader:
     """Load ordered PNG/JPG image sequences from folders into (N,H,W,3) uint8 BGR."""

@@ -6,6 +6,7 @@ import csv
 import cv2
 import numpy as np
 import pyvista as pv
+from PyQt5 import QtCore, QtGui, QtWidgets
 from concurrent.futures import ThreadPoolExecutor
 from scipy.io import savemat
 
@@ -24,6 +25,33 @@ from algorithms.out_of_plane import (
     OutOfPlaneRotConfig,
     compute_beta_gamma_from_right_grid,
 )
+
+
+class _BrushLabelEventFilter(QtCore.QObject):
+    def __init__(self, controller):
+        super().__init__()
+        self.controller = controller
+
+    def eventFilter(self, obj, event):
+        c = self.controller
+        if not getattr(c, "is_labeling", False):
+            return False
+
+        et = event.type()
+        if et == QtCore.QEvent.MouseButtonPress:
+            c._qt_label_mouse_press(event)
+            return True
+        if et == QtCore.QEvent.MouseMove:
+            c._qt_label_mouse_move(event)
+            return True
+        if et == QtCore.QEvent.MouseButtonRelease:
+            c._qt_label_mouse_release(event)
+            return True
+        if et == QtCore.QEvent.Wheel:
+            c._qt_label_wheel(event)
+            return True
+        return False
+
 
 class VisualizerController:
     """
@@ -72,10 +100,14 @@ class VisualizerController:
         # map rendered frame_idx -> actors for quick show/hide during labeling
         self.frame_actor_map = {}  # {frame_idx: {"full":actor, "crop":actor, "red":actor, "yellow":actor, "grid":actor}}
         self.temp_label_actor = None                 # The green line currently being drawn
-        self.temp_label_points_actor = None
-        self._temp_polyline = None
-        self._temp_points = None
-        self._label_click_tracking_enabled = False
+        self.label_masks: Dict[int, np.ndarray] = {}
+        self.label_brush_radius = 8
+        self._label_painting = False
+        self._label_paint_mode = "paint"
+        self._label_last_uv = None
+        self._label_qt_events_installed = False
+        self._label_event_filter = None
+        self._label_original_qt_events = {}
         self._label_undo_key_enabled = False
         self._label2d_frame_idx = None
 
@@ -497,11 +529,8 @@ class VisualizerController:
             def _load_roi(path: str) -> np.ndarray:
                 return VideoLoader(output_fps=self.cfg.output_fps).extract_roi_frames(path, roi)
 
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                fut_left = ex.submit(_load_roi, self.sess.left_source_path)
-                fut_right = ex.submit(_load_roi, self.sess.right_source_path)
-                self.sess.left_frames = fut_left.result()
-                self.sess.right_frames = fut_right.result()
+            self.sess.left_frames = _load_roi(self.sess.left_source_path)
+            self.sess.right_frames = _load_roi(self.sess.right_source_path)
         else:
             self.sess.left_frames = self.sess.left_frames_original[:, y1:y2, x1:x2, :].copy()
             self.sess.right_frames = self.sess.right_frames_original[:, y1:y2, x1:x2, :].copy()
@@ -1039,7 +1068,7 @@ class VisualizerController:
         )
 
         n_frames = min(int(len(self.sess.band_left)), int(len(self.sess.band_right)))
-        heatmap_max_r_ahead = 100
+        heatmap_max_r_ahead = max(1, int(getattr(self.cfg, "y_heatmap_max_r_ahead", 50)))
         use_scan_dir = bool(getattr(self.cfg, "enable_scan_direction_detection", True))
         if use_scan_dir:
             direction, H_fwd, best_fwd, H_rev, best_rev, r2_fwd, r2_rev = \
@@ -1693,6 +1722,23 @@ class VisualizerController:
         except Exception as e:
             print(f"Surface reconstruction failed: {e}")
             return None
+
+    def _smooth_surface_if_enabled(self, mesh: pv.PolyData) -> pv.PolyData:
+        """Apply optional spatial smoothing to the generated surface mesh."""
+        if mesh is None or not bool(getattr(self.cfg, "enable_surface_smoothing", False)):
+            return mesh
+
+        try:
+            return mesh.smooth(
+                n_iter=max(1, int(getattr(self.cfg, "surface_smoothing_iterations", 30))),
+                relaxation_factor=float(getattr(self.cfg, "surface_smoothing_relaxation", 0.01)),
+                feature_smoothing=False,
+                boundary_smoothing=True,
+                inplace=False,
+            ).clean()
+        except Exception as e:
+            print(f"Surface smoothing failed: {e}")
+            return mesh
         
     def _build_mm_volume_mesh_from_display_mesh(self, mesh_px: pv.PolyData) -> Optional[pv.PolyData]:
         """
@@ -1913,11 +1959,8 @@ class VisualizerController:
         except Exception:
             pass
 
-        # IMPORTANT: register once. Re-registering on every frame switch stacks callbacks
-        # and makes one click do duplicate work after long labeling sessions.
-        if not self._label_click_tracking_enabled:
-            self.plotter.track_click_position(callback=self.on_label_click_2d, side="left")
-            self._label_click_tracking_enabled = True
+        self._ensure_label_mask_for_frame(idx)
+        self._install_label_brush_events()
 
         self._redraw_current_temp_label_2d(render_now=False)
         self.plotter.render()
@@ -1941,31 +1984,211 @@ class VisualizerController:
 
         self.plotter.render()
 
-
-    def on_label_click_2d(self, point):
-        """
-        point: world coordinate on y=0 plane
-        convert to (u,v) in ROI image coordinates and store
-        """
-        if not self.is_labeling or self.active_frame_idx < 0:
+    def _install_label_brush_events(self):
+        if self._label_qt_events_installed or self.plotter is None:
             return
 
-        wx = float(point[0])
-        wz = float(point[2])
+        widget = self.plotter
+        self._label_event_filter = _BrushLabelEventFilter(self)
+        try:
+            widget.installEventFilter(self._label_event_filter)
+        except Exception:
+            pass
+        self._label_original_qt_events = {
+            "mousePressEvent": getattr(widget, "mousePressEvent", None),
+            "mouseMoveEvent": getattr(widget, "mouseMoveEvent", None),
+            "mouseReleaseEvent": getattr(widget, "mouseReleaseEvent", None),
+            "wheelEvent": getattr(widget, "wheelEvent", None),
+        }
+        widget.mousePressEvent = self._qt_label_mouse_press
+        widget.mouseMoveEvent = self._qt_label_mouse_move
+        widget.mouseReleaseEvent = self._qt_label_mouse_release
+        widget.wheelEvent = self._qt_label_wheel
+        try:
+            widget.setMouseTracking(True)
+        except Exception:
+            pass
+        self._label_qt_events_installed = True
 
-        # clamp to ROI bounds
-        wx = max(0.0, min(float(self.sess.frame_w - 1), wx))
-        wz = max(0.0, min(float(self.sess.frame_h - 1), wz))
+    def _qt_event_pos(self, event) -> Tuple[int, int]:
+        try:
+            p = event.position()
+            return int(p.x()), int(p.y())
+        except AttributeError:
+            p = event.pos()
+            return int(p.x()), int(p.y())
 
-        u = wx
-        v = float(self.sess.frame_h) - wz
+    def _qt_event_to_label_uv(self, event) -> Optional[Tuple[float, float]]:
+        x, y_top = self._qt_event_pos(event)
+        height = int(self.plotter.height()) if self.plotter is not None else 0
+        return self._display_xy_to_label_uv(int(x), int(max(0, height - y_top)))
 
+    def _qt_label_mouse_press(self, event):
+        if not self.is_labeling:
+            original = self._label_original_qt_events.get("mousePressEvent")
+            if original is not None:
+                return original(event)
+            return
+
+        button = event.button()
+        if button == QtCore.Qt.LeftButton:
+            self._label_paint_mode = "paint"
+        elif button == QtCore.Qt.RightButton:
+            self._label_paint_mode = "erase"
+        else:
+            event.accept()
+            return
+
+        uv = self._qt_event_to_label_uv(event)
+        if uv is not None:
+            self._label_painting = True
+            self._label_last_uv = uv
+            self._paint_label_mask_stroke(uv, uv, mode=self._label_paint_mode)
+            self._redraw_current_temp_label_2d(render_now=True, cursor_uv=uv)
+        event.accept()
+
+    def _qt_label_mouse_move(self, event):
+        if not self.is_labeling:
+            original = self._label_original_qt_events.get("mouseMoveEvent")
+            if original is not None:
+                return original(event)
+            return
+
+        uv = self._qt_event_to_label_uv(event)
+        if uv is not None:
+            if self._label_painting:
+                prev = self._label_last_uv if self._label_last_uv is not None else uv
+                self._paint_label_mask_stroke(prev, uv, mode=self._label_paint_mode)
+                self._label_last_uv = uv
+            self._redraw_current_temp_label_2d(render_now=True, cursor_uv=uv)
+        event.accept()
+
+    def _qt_label_mouse_release(self, event):
+        if not self.is_labeling:
+            original = self._label_original_qt_events.get("mouseReleaseEvent")
+            if original is not None:
+                return original(event)
+            return
+
+        self._label_painting = False
+        self._label_last_uv = None
+        self._sync_manual_contour_from_mask(int(self.active_frame_idx))
+        self._redraw_current_temp_label_2d(render_now=True)
+        event.accept()
+
+    def _qt_label_wheel(self, event):
+        if not self.is_labeling:
+            original = self._label_original_qt_events.get("wheelEvent")
+            if original is not None:
+                return original(event)
+            return
+
+        delta = event.angleDelta().y()
+        step = 2 if delta >= 0 else -2
+        self.label_brush_radius = max(1, min(80, int(self.label_brush_radius) + step))
+        self._update_label_status()
+        uv = self._qt_event_to_label_uv(event)
+        self._redraw_current_temp_label_2d(render_now=True, cursor_uv=uv)
+        event.accept()
+
+    def _display_xy_to_label_uv(self, x: int, y: int) -> Optional[Tuple[float, float]]:
+        renderer = getattr(self.plotter, "renderer", None)
+        if renderer is None:
+            return None
+        try:
+            pts = []
+            for z in (0.0, 1.0):
+                renderer.SetDisplayPoint(float(x), float(y), z)
+                renderer.DisplayToWorld()
+                p = np.asarray(renderer.GetWorldPoint(), dtype=np.float64)
+                if abs(float(p[3])) > 1e-12:
+                    p = p[:3] / float(p[3])
+                else:
+                    p = p[:3]
+                pts.append(p)
+            p0, p1 = pts
+            denom = float(p1[1] - p0[1])
+            if abs(denom) < 1e-12:
+                return None
+            world = p0 + ((0.0 - float(p0[1])) / denom) * (p1 - p0)
+        except Exception:
+            return None
+
+        u = max(0.0, min(float(self.sess.frame_w - 1), float(world[0])))
+        v = max(0.0, min(float(self.sess.frame_h - 1), float(self.sess.frame_h) - float(world[2])))
+        return u, v
+
+    def _ensure_label_mask_for_frame(self, idx: int):
+        idx = int(idx)
+        h = int(self.sess.frame_h)
+        w = int(self.sess.frame_w)
+        mask = self.label_masks.get(idx)
+        if mask is not None and mask.shape == (h, w):
+            return
+        mask = np.zeros((h, w), dtype=np.uint8)
+        pts = self.sess.manual_contours.get(idx, None)
+        if pts and len(pts) >= 3:
+            contour = np.asarray(pts, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.fillPoly(mask, [contour], 255)
+        self.label_masks[idx] = mask
+
+    def _sync_manual_contour_from_mask(self, idx: int):
+        idx = int(idx)
+        mask = self.label_masks.get(idx)
+        if mask is None or not np.any(mask):
+            self.sess.manual_contours.pop(idx, None)
+            return
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if not contours:
+            self.sess.manual_contours.pop(idx, None)
+            return
+
+        contour = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(contour) <= 0:
+            self.sess.manual_contours.pop(idx, None)
+            return
+
+        contour = contour.reshape(-1, 2)
+        self.sess.manual_contours[idx] = [(float(x), float(y)) for x, y in contour]
+
+    def _paint_label_mask_stroke(
+        self,
+        uv0: Tuple[float, float],
+        uv1: Tuple[float, float],
+        mode: str,
+    ):
+        if not self.is_labeling or self.active_frame_idx < 0:
+            return
         idx = int(self.active_frame_idx)
-        if idx not in self.sess.manual_contours:
-            self.sess.manual_contours[idx] = []
-        self.sess.manual_contours[idx].append((u, v))
+        self._ensure_label_mask_for_frame(idx)
+        mask = self.label_masks[idx]
+        color = 255 if mode == "paint" else 0
+        p0 = (int(round(float(uv0[0]))), int(round(float(uv0[1]))))
+        p1 = (int(round(float(uv1[0]))), int(round(float(uv1[1]))))
+        cv2.line(
+            mask,
+            p0,
+            p1,
+            int(color),
+            thickness=max(1, int(self.label_brush_radius) * 2),
+            lineType=cv2.LINE_AA,
+        )
+        cv2.circle(
+            mask,
+            p1,
+            int(self.label_brush_radius),
+            int(color),
+            thickness=-1,
+            lineType=cv2.LINE_AA,
+        )
 
-        self._redraw_current_temp_label_2d()
+    def _update_label_status(self):
+        self.update_status(
+            f"2D Brush Labeling (step=10)\n"
+            f"Frame: {self.active_frame_idx} | Brush: {int(self.label_brush_radius)} px\n"
+            "Left drag: paint | Right drag: erase | Wheel: brush size"
+        )
 
     # -------------------------
     # Manual Labeling & 3D Interaction
@@ -1982,9 +2205,9 @@ class VisualizerController:
             pass
 
         self.update_status(
-            f"2D Labeling (step=10)\n"
+            f"2D Brush Labeling (step=10)\n"
             f"Frame: {self.active_frame_idx}\n"
-            "Click: add point | Drag: pan | Wheel: zoom | 'z': undo"
+            "Left drag: paint | Right drag: erase | Wheel: brush size"
         )
 
         # bind undo
@@ -2009,14 +2232,6 @@ class VisualizerController:
             except Exception:
                 pass
             self.temp_label_actor = None
-
-        # remove temp points
-        if getattr(self, "temp_label_points_actor", None):
-            try:
-                self.plotter.remove_actor(self.temp_label_points_actor)
-            except Exception:
-                pass
-            self.temp_label_points_actor = None
 
         self._exit_2d_label_view()
         # --- NEW: force frames back on (so 3D stack is visible) ---
@@ -2050,9 +2265,9 @@ class VisualizerController:
         self.active_frame_idx = idx
 
         self.update_status(
-            f"2D Labeling (step=10)\n"
+            f"2D Brush Labeling (step=10)\n"
             f"Frame: {self.active_frame_idx}\n"
-            "Click: add point | Drag: pan | Wheel: zoom | 'z': undo"
+            "Left drag: paint | Right drag: erase | Wheel: brush size"
         )
 
         if self.is_labeling:
@@ -2063,20 +2278,21 @@ class VisualizerController:
 
 
     def undo_last_point(self):
-        """Removes the last added point for the current frame."""
+        """Clear the current brush label."""
         if self.active_frame_idx in self.sess.manual_contours:
-            if self.sess.manual_contours[self.active_frame_idx]:
-                self.sess.manual_contours[self.active_frame_idx].pop()
-                if self.is_labeling:
-                    self._redraw_current_temp_label_2d()
-                else:
-                    self._redraw_current_temp_label()
+            del self.sess.manual_contours[self.active_frame_idx]
+        self.label_masks.pop(int(self.active_frame_idx), None)
+        if self.is_labeling:
+            self._redraw_current_temp_label_2d()
+        else:
+            self._redraw_current_temp_label()
 
 
     def clear_label_for_frame(self, idx: int):
         """Deletes all points for a specific frame."""
         if idx in self.sess.manual_contours:
             del self.sess.manual_contours[idx]
+        self.label_masks.pop(int(idx), None)
         if idx in self.existing_label_actors:
             self.plotter.remove_actor(self.existing_label_actors[idx])
             del self.existing_label_actors[idx]
@@ -2087,7 +2303,51 @@ class VisualizerController:
                 self._redraw_current_temp_label()
 
 
-    def _redraw_current_temp_label_2d(self, render_now: bool = True):
+    def _update_label2d_texture(self, idx: int, cursor_uv: Optional[Tuple[float, float]] = None):
+        self._ensure_label_mask_for_frame(idx)
+        if self.label2d_full_actor is None:
+            return
+
+        frame = self._get_display_frame_for_idx(idx)
+        if frame.ndim == 3 and frame.shape[2] == 4:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
+        elif frame.ndim == 3:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        else:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+
+        rgb = np.ascontiguousarray(rgb.copy())
+        mask = self.label_masks.get(int(idx))
+        if mask is not None and np.any(mask):
+            m = mask > 0
+            rgb[m] = (0.55 * rgb[m] + 0.45 * np.array([0, 255, 0], dtype=np.float32)).astype(np.uint8)
+
+        pts2d = self.sess.manual_contours.get(int(idx), None)
+        if pts2d and len(pts2d) >= 2:
+            contour = np.asarray(pts2d, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(rgb, [contour], isClosed=True, color=(0, 255, 0), thickness=2, lineType=cv2.LINE_AA)
+
+        if cursor_uv is not None:
+            u, v = float(cursor_uv[0]), float(cursor_uv[1])
+            cv2.circle(
+                rgb,
+                (int(round(u)), int(round(v))),
+                int(self.label_brush_radius),
+                (255, 230, 0),
+                thickness=2,
+                lineType=cv2.LINE_AA,
+            )
+
+        try:
+            self.label2d_full_actor.SetTexture(pv.numpy_to_texture(rgb))
+        except Exception as e:
+            print(f"Label texture update failed: {e}")
+
+    def _redraw_current_temp_label_2d(
+        self,
+        render_now: bool = True,
+        cursor_uv: Optional[Tuple[float, float]] = None,
+    ):
         """
         Fast 2D redraw:
         - DO NOT remove/add actors (avoid flicker)
@@ -2096,11 +2356,13 @@ class VisualizerController:
           a contour grows to hundreds of points.
         """
         idx = int(self.active_frame_idx)
+        if idx >= 0:
+            self._update_label2d_texture(idx, cursor_uv=cursor_uv)
+
         pts2d = self.sess.manual_contours.get(idx, None)
         if not pts2d:
             # hide actors if no points
             self._set_actor_visibility(self.temp_label_actor, False)
-            self._set_actor_visibility(self.temp_label_points_actor, False)
             if render_now:
                 self.plotter.render()
             return
@@ -2115,30 +2377,6 @@ class VisualizerController:
         pts[:, 1] = y_eps
         pts[:, 2] = float(crop_h) - pts2d_np[:, 1]
 
-        # --- points actor (immediate feedback even with 1 point) ---
-        cloud = pv.PolyData(pts)
-        if self.temp_label_points_actor is None:
-            self.temp_label_points_actor = self.plotter.add_mesh(
-                cloud,
-                color="lime",
-                point_size=7,
-                render_points_as_spheres=False,
-                lighting=False,
-            )
-        else:
-            try:
-                self.temp_label_points_actor.mapper.SetInputData(cloud)
-                self._set_actor_visibility(self.temp_label_points_actor, True)
-            except Exception:
-                # fallback: recreate once if mapper update fails
-                try:
-                    self.plotter.remove_actor(self.temp_label_points_actor)
-                except Exception:
-                    pass
-                self.temp_label_points_actor = self.plotter.add_mesh(
-                    cloud, color="lime", point_size=7, render_points_as_spheres=False, lighting=False
-                )
-
         # --- polyline actor (only when >=2 pts) ---
         if len(pts) < 2:
             self._set_actor_visibility(self.temp_label_actor, False)
@@ -2146,7 +2384,7 @@ class VisualizerController:
                 self.plotter.render()
             return
 
-        poly = pv.lines_from_points(pts, close=False)
+        poly = pv.lines_from_points(pts, close=True)
         if self.temp_label_actor is None:
             self.temp_label_actor = self.plotter.add_mesh(
                 poly,
@@ -2670,6 +2908,7 @@ class VisualizerController:
             surf = surf.fill_holes(1000).clean()
         except:
             pass
+        surf = self._smooth_surface_if_enabled(surf)
 
         # Cleanup old actors
         if self.surface_actor:
@@ -2700,9 +2939,10 @@ class VisualizerController:
                 )
             else:
                 suffix = ""
+            smooth_suffix = " Surface smoothing enabled." if bool(getattr(self.cfg, "enable_surface_smoothing", False)) else ""
             status_text = (
                 f"Surface Aligned. Volume: {vol_mm3:.2f} mm3 ({self.sess.surface_volume_ml:.3f} mL)\n"
-                f"Used {num_frames} frames with {M} aligned pts/ring{suffix}."
+                f"Used {num_frames} frames with {M} aligned pts/ring{suffix}.{smooth_suffix}"
             )
             self.update_status(status_text)
         except Exception as e:
@@ -2941,7 +3181,7 @@ class VisualizerController:
             frame_idx = int(k * stride)
 
             a_full = self.plotter.add_mesh(data["full"][0], texture=data["full"][1], opacity=0.15)
-            a_crop = self.plotter.add_mesh(data["crop"][0], texture=data["crop"][1], opacity=0.95)
+            a_crop = self.plotter.add_mesh(data["crop"][0], texture=data["crop"][1], opacity=0.0)
 
             # red crop box
             a_crop_border = self.plotter.add_mesh(

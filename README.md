@@ -1,202 +1,121 @@
-# Free hand 3D ultrasounic imaging system
+# Freehand 3D Ultrasound Imaging System
 
-A PyQt5 + PyVista desktop tool for loading synchronized left/right ultrasound videos, selecting an ROI, choosing a crop center, stabilizing the sequence, visualizing stacked 3D frames, inspecting out-of-plane motion, and manually labeling contours to reconstruct a 3D surface and estimate volume.
+A desktop tool for reconstructing and inspecting 3D ultrasound data from synchronized left/right ultrasound image streams. The app provides an interactive PyQt5 + PyVista workflow for loading data, selecting the ultrasound region, stabilizing frames, visualizing stacked 3D slices, labeling contours, and exporting reconstruction results.
 
-This README is written for two purposes:
+## Features
 
-1. **Upload to GitHub** as the project homepage.
-2. **Recreate the environment on another computer** (for example, your laptop).
+- Load data from offline left/right videos, simulation image folders, or live PSRT capture.
+- Interactively select the ultrasound ROI and crop center.
+- Decode only the selected ROI to reduce memory use on large videos.
+- Optional NCC + Kabsch stabilization on the selected crop region.
+- Visualize stacked ultrasound frames in 3D with red crop box, yellow band, and orange 3x3 grid overlays.
+- Compute Y-direction optical-flow heatmaps and beta/gamma out-of-plane rotation estimates.
+- Manually label contours in a 2D frame view.
+- Generate a 3D surface from labeled contours and estimate volume.
+- Export evaluation data to `pred_eval.mat` for MATLAB-side analysis.
 
----
+## Quick Start
 
-## 1. Main features
+### 1. Create environment
 
-- Load **left/right AVI videos** and sample frames at a target FPS.
-- Select the ultrasound ROI interactively.
-- Select a crop center and generate a **100×100 crop** plus a **3×3 grid** overlay.
-- Optional **NCC + Kabsch stabilization** on the cropped region.
-- Compute and display:
-  - **Y heatmap** (out-of-plane displacement-like analysis)
-  - **β/γ rotation** curves
-- Build a stacked **3D PyVista visualization**.
-- Support **manual labeling** on selected frames and reconstruct a **3D surface**.
-- Estimate **surface volume** in mm³ / mL.
-- Save cropped frames, stabilization debug images, and analysis outputs to an output folder.
-
----
-
-## 2. Expected project structure
-
-Recommended repository structure:
-
-```text
-your-repo/
-├─ main.py
-├─ config.py
-├─ requirements.txt
-├─ README.md
-├─ core/
-│  ├─ loader.py
-│  └─ session.py
-├─ gui/
-│  ├─ window.py
-│  └─ visualizer.py
-├─ algorithms/
-│  ├─ geometry.py
-│  ├─ stabilizer.py
-│  └─ out_of_plane.py
-├─ analysis/
-│  └─ gt_plot.py                 # optional but required if GT plot is enabled
-├─ data/                         # optional
-│  ├─ Ln.avi
-│  ├─ Rn.avi
-│  └─ tracker_data_1.csv
-└─ output/
-```
-
-> Note: the current code imports modules using package paths such as `core.loader`, `gui.window`, and `algorithms.stabilizer`, so your GitHub repository should keep those folders instead of putting everything at the root.
-
----
-
-## 3. System requirements
-
-### Recommended
-
-- **OS:** Windows 10 / Windows 11
-- **Python:** 3.10
-- **GPU:** optional
-
----
-
-## 4. Create a fresh environment on a new computer
-
-Use Conda as the standard setup flow:
+Python 3.10 is recommended.
 
 ```bash
-git https://github.com/JuHsuanWang/Free-hand-3D-ultrasonic-imaging-system.git
-cd Free-hand-3D-ultrasonic-imaging-system
-conda create -n us3d python=3.10 -y
-conda activate us3d
+conda create -n freehand3d python=3.10 -y
+conda activate freehand3d
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
----
+`decord` is optional. If installed, the app will try GPU video decoding first and fall back when needed.
 
-## 5. Input files
-
-At minimum, the program needs two video files:
-
-- left video
-- right video
-
-By default, `main.py` looks for:
-
-- `Ln.avi`
-- `Rn.avi`
-
-in the current working directory.
-
-If you pass command-line arguments, those paths will be used instead.
-
-### Optional input
-
-- `tracker_data_1.csv`
-  - used for GT comparison when `enable_gt_plot = True`
-- `analysis/gt_plot.py`
-  - required by the GT plotting code path
-
-If you do not need EM/GT comparison, you can disable it in `config.py` by setting:
-
-```python
-enable_gt_plot = False
+```bash
+pip install decord
 ```
 
----
-
-## 6. How to run
-
-### Run with default filenames
-
-Put `Ln.avi` and `Rn.avi` next to `main.py`, then run:
+### 2. Run the app
 
 ```bash
 python main.py
 ```
 
-### Run with explicit paths
+The app starts with an empty window and waits for you to choose a data source.
 
-```bash
-python main.py path/to/left_video.avi path/to/right_video.avi
-```
+![Main window](docs/images/main_window.png)
 
----
+### 3. Choose input data
 
-## 7. Workflow in the GUI
+Use one of the buttons in the right panel:
 
-After launching:
+- `Load Offline Videos`: choose the left-plane video first, then the right-plane video.
+- `Load Simulation Data`: choose the left image folder first, then the right image folder.
+- `Live Capture (PSRT)`: run the PSRT capture script, then load the captured videos.
 
-1. **ROI selection**
-   - Click the **top-left** corner of the ultrasound region.
-   - Click the **bottom-right** corner.
-   - Press **Enter** to confirm.
+For offline video mode, common inputs are `.avi` or `.mp4` files.
 
-2. **Crop-center selection**
-   - Click the crop center.
-   - The program shows:
-     - red center point
-     - red central box
-     - orange 3×3 grid
-     - yellow middle band
-   - Press **Enter** to start processing.
+## Basic Workflow
 
-3. **Processing stage**
-   - Optional stabilization
-   - crop refresh
-   - segmentation
-   - output saving
-   - optional GT plotting
+1. Select ROI
+   - Click the top-left corner of the ultrasound region.
+   - Click the bottom-right corner.
+   - Press `Enter`.
 
-4. **3D stage**
-   - inspect stacked frames
-   - show/hide overlays
-   - show Y heatmap
-   - show β/γ rotation
+   ![ROI selection](docs/images/roi_selection.png)
 
-5. **Manual labeling / surface reconstruction**
-   - Use the manual labeling tools to annotate the target contour on selected frames.
-   - Generate a closed 3D surface from the labeled contours.
-   - Compute the estimated volume.
+2. Select crop center
+   - Click the center of the target crop.
+   - The app shows the crop box, 3x3 grid, and middle band.
+   - Press `Enter` to start processing.
 
----
+   ![Crop center selection](docs/images/crop_center.png)
 
-## 8. Output folders
+3. Inspect the 3D view
+   - Toggle frame, red-box, yellow-band, and grid overlays from the control panel.
+   - Use `Show Y Heatmap` to inspect optical-flow matching.
+   - Use `Show Beta/Gamma Rotation` to inspect out-of-plane rotation estimates.
 
-The program creates an output directory for each run:
+   ![3D stacked frame visualization](docs/images/3d_view.png)
+
+4. Manual labeling
+   - Use the frame slider to choose a frame.
+   - Click `Start Labeling`.
+   - Draw or edit the contour in the 2D labeling view.
+   - Repeat on the frames you want to use.
+
+   ![Manual labeling](docs/images/manual_labeling.png)
+
+5. Generate result
+   - Click `Generate 3D Surface`.
+   - The app builds a surface from the labeled contours and reports the estimated volume.
+
+   ![Reconstructed surface](docs/images/reconstructed_surface.png)
+
+## Outputs
+
+Each run creates a folder under:
 
 ```text
 output/<run_name>/
 ```
 
-Typical saved content may include:
+Typical outputs include:
 
-- cropped left/right frames
-- stabilization debug images
-- segmentation or labeling outputs
-- CSV / plots for motion analysis
-- reconstructed surface results
+- `cropped_frames/` when PNG saving is enabled.
+- `stabilized_frames/` when stabilization debug saving is enabled.
+- `pred_eval.mat` when evaluation export is enabled.
+- plots or intermediate outputs generated from the heatmap and reconstruction tools.
 
-The exact content depends on which options are enabled in `config.py` and which buttons/tools you use in the GUI.
+Most output behavior is controlled in `config.py`.
 
----
+## Important Configuration
 
-## 9. Quick start
+Common settings in `config.py`:
 
-```bash
-conda create -n us3d python=3.10 -y
-conda activate us3d
-pip install --upgrade pip
-pip install -r requirements.txt
-python main.py
-```
+- `output_fps`: sampled video FPS used by the app.
+- `video_crop_size`: crop box size for offline videos.
+- `y_heatmap_max_r_ahead`: optical-flow comparison range, currently set to 50 frames.
+- `enable_eval_export`: export `pred_eval.mat` after surface generation.
+
+
+
 
