@@ -50,15 +50,15 @@ For offline video mode, common inputs are `.avi` or `.mp4` files.
    - Click the top-left corner of the ultrasound region.
    - Click the bottom-right corner.
    - Press `Enter`.
-
-   ![ROI selection](docs/images/roi_selection.png)
+ 
+   ![Crop center selection](docs/images/crop_center.png)
 
 2. Select crop center
    - Click the center of the target crop.
    - The app shows the crop box, 3x3 grid, and middle band.
    - Press `Enter` to start processing.
 
-   ![Crop center selection](docs/images/crop_center.png)
+   ![ROI selection](docs/images/roi_selection.png)
 
 3. Inspect the 3D view
    - Toggle frame, red-box, yellow-band, and grid overlays from the control panel.
