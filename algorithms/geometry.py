@@ -21,7 +21,7 @@ def full_img_to_world_3d(img_x: int, img_y: int, frame_idx: int, frame_h: int, y
 
 
 def generate_grid_points(h: int, w: int, grid: int = 5, margin: int = 20) -> np.ndarray:
-    """Generate grid×grid points in pixel coordinates (x,z)."""
+    """Generate grid x grid points in pixel coordinates (x,z)."""
     xs = np.linspace(margin, w - 1 - margin, grid)
     zs = np.linspace(margin, h - 1 - margin, grid)
     pts = []

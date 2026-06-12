@@ -33,10 +33,10 @@ class AppConfig:
     # --------------------------------------------------
     # Offline video mode
     video_crop_size: int = 100
-    #video_y_spacing: float = 5.4
-    video_y_spacing: float = 3.4
-    #video_fh_dy_mm_per_frame: float = 0.1950
-    video_fh_dy_mm_per_frame: float = 0.11
+    video_y_spacing: float = 5.4
+    #video_y_spacing: float = 3.4
+    video_fh_dy_mm_per_frame: float = 0.1950
+    #video_fh_dy_mm_per_frame: float = 0.11
     video_enable_stabilization: bool = True
     video_stab_win: int = 16
     video_stab_search: int = 4
@@ -97,6 +97,12 @@ class AppConfig:
     # When False, use the original fixed L(reference) -> R(comparison) series.
     enable_scan_direction_detection: bool = False
 
+    # When True and scan direction detection is disabled, derive frame-to-frame
+    # Y spacing from the L->R displacement-map frame offset and current LR distance.
+    enable_y_spacing_from_displacement_map: bool = True
+    displacement_offset_min_frames: float = 1.0
+    displacement_slope_warning_tol: float = 0.1
+
     # Scan direction is allowed to change only at coarse segment boundaries.
     scan_direction_segment_frames: int = 100
     y_heatmap_max_r_ahead: int = 50
@@ -110,6 +116,9 @@ class AppConfig:
     enable_crop_top: bool = True
 
     # --- Surface post-processing ---
+    surface_alpha: float = 5.0
+    voxel_size: float = 1.0
+    max_points: int = 20000
     enable_surface_smoothing: bool = True
     surface_smoothing_iterations: int = 30
     surface_smoothing_relaxation: float = 0.01

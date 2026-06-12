@@ -1,18 +1,9 @@
 # Freehand 3D Ultrasound Imaging System
 
-A desktop tool for reconstructing and inspecting 3D ultrasound data from synchronized left/right ultrasound image streams. The app provides an interactive PyQt5 + PyVista workflow for loading data, selecting the ultrasound region, stabilizing frames, visualizing stacked 3D slices, labeling contours, and exporting reconstruction results.
+A desktop tool for reconstructing and inspecting 3D ultrasound data from synchronized left/right ultrasound image streams. This project is based on a Prodigy ultrasound system and a zipper array transducer. The app provides an interactive PyQt5 + PyVista workflow for loading data, selecting the ultrasound region, stabilizing frames, visualizing stacked 3D slices, labeling contours, and exporting reconstruction results.
 
-## Features
+For best reconstruction accuracy, the zipper array transducer should be moved slowly and at a steady speed during scanning. Sudden acceleration, pauses, or uneven hand motion can reduce the reliability of frame-to-frame spacing estimation and 3D stacking.
 
-- Load data from offline left/right videos, simulation image folders, or live PSRT capture.
-- Interactively select the ultrasound ROI and crop center.
-- Decode only the selected ROI to reduce memory use on large videos.
-- Optional NCC + Kabsch stabilization on the selected crop region.
-- Visualize stacked ultrasound frames in 3D with red crop box, yellow band, and orange 3x3 grid overlays.
-- Compute Y-direction optical-flow heatmaps and beta/gamma out-of-plane rotation estimates.
-- Manually label contours in a 2D frame view.
-- Generate a 3D surface from labeled contours and estimate volume.
-- Export evaluation data to `pred_eval.mat` for MATLAB-side analysis.
 
 ## Quick Start
 
@@ -92,6 +83,8 @@ For offline video mode, common inputs are `.avi` or `.mp4` files.
 
 ## Outputs
 
+Outputs are mainly intended for debugging, experiment records, and downstream analysis.
+
 Each run creates a folder under:
 
 ```text
@@ -115,7 +108,5 @@ Common settings in `config.py`:
 - `video_crop_size`: crop box size for offline videos.
 - `y_heatmap_max_r_ahead`: optical-flow comparison range, currently set to 50 frames.
 - `enable_eval_export`: export `pred_eval.mat` after surface generation.
-
-
 
 

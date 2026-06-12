@@ -173,7 +173,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.btn_toggle_frames = QtWidgets.QPushButton("Close Frames")
         self.btn_show_y = QtWidgets.QPushButton("Show Y Heatmap")
-        self.btn_show_beta_gamma = QtWidgets.QPushButton("Show β/γ Rotation")
+        self.btn_show_beta_gamma = QtWidgets.QPushButton("Show Beta/Gamma Rotation")
 
         btn_font = QtGui.QFont("Microsoft JhengHei UI", 12, QtGui.QFont.Bold)
         self.btn_toggle_frames.setFont(btn_font)
@@ -496,7 +496,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.sess.selection_confirmed:
             QtWidgets.QMessageBox.information(
                 self,
-                "Show β/γ Rotation",
+                "Show Beta/Gamma Rotation",
                 "Please finish ROI/crop selection and run processing first."
             )
             return

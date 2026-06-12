@@ -103,6 +103,9 @@ class SessionState:
     scan_direction_segments: List[Dict] = field(default_factory=list)
     scan_direction_per_frame: List[str] = field(default_factory=list)
     scan_y_positions: Optional[np.ndarray] = None
+    y_positions_are_physical_mm: bool = False
+    displacement_y_spacing_mm_per_frame: Optional[float] = None
+    displacement_y_spacing_info: Dict = field(default_factory=dict)
 
 
     # Visualization toggles

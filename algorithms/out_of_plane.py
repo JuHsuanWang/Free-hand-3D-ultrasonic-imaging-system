@@ -80,12 +80,12 @@ def calculate_optical_flow_similarity_like_matlab_boxfilter_pregrad(
     cfg: OutOfPlaneConfig,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """
-    O(1) LK via boxFilter – fully vectorized (no Python loop over grid points).
+    O(1) LK via boxFilter - fully vectorized (no Python loop over grid points).
 
     Same math / boundary rules as the original MATLAB-like version:
-      - det(AtA) < det_thresh  → skip
-      - v = (AtA)⁻¹ Atb
-      - |v| > max_displacement → skip
+      - det(AtA) < det_thresh -> skip
+      - v = inv(AtA) Atb
+      - |v| > max_displacement -> skip
       - similarity = mean(exp(-residual)) over valid points
     """
     img1 = img1.astype(np.float64, copy=False)
@@ -138,7 +138,7 @@ def calculate_optical_flow_similarity_like_matlab_boxfilter_pregrad(
     disp = np.hypot(vx, vy)
     good2 = good & (disp <= float(cfg.max_displacement))
 
-    # SSE → local similarity
+    # SSE -> local similarity
     vAtAv = vx * (sxx * vx + sxy * vy) + vy * (sxy * vx + syy * vy)
     vAtb  = vx * bx + vy * by
     sse   = np.maximum(vAtAv + 2.0 * vAtb + stt, 0.0)
@@ -166,7 +166,7 @@ def _precompute_ref_maps(
     """
     Compute Sxx, Syy, Sxy (the AtA box-filter maps) for ONE reference frame.
     These only depend on the reference image, so they can be cached and reused
-    for every comparison frame – saving 3 boxFilter calls per pair.
+    for every comparison frame - saving 3 boxFilter calls per pair.
     """
     ksize = (win, win)
     b = cv2.BORDER_CONSTANT
@@ -195,7 +195,7 @@ def _lk_mean_disp_fast(
 
     Sxx/Syy/Sxy are precomputed for the reference frame (cached by caller).
     Only the pair-specific maps Sxt, Syt are computed here (2 boxFilters instead of 6).
-    Grid point sampling is fully vectorized – no Python loop.
+    Grid point sampling is fully vectorized - no Python loop.
     """
     It = cur_norm - ref_norm
     ksize = (win, win)
@@ -311,17 +311,17 @@ def compute_lr_heatmap_like_matlab(
 ) -> Tuple[np.ndarray, List[Tuple[int, int, float]]]:
     """
     Optimised MATLAB-style heatmap:
-      H[l, r] = mean LK displacement(left_l → right_r)  for r in [l+1, l+max_r_ahead)
+      H[l, r] = mean LK displacement(left_l -> right_r)  for r in [l+1, l+max_r_ahead)
 
     Speed improvements over the original:
-      • Sxx/Syy/Sxy (AtA maps) cached once per reference frame  → 3 fewer boxFilters/pair
-      • Grid-point sampling fully vectorised  → no Python loop per pair
-      • Boundary check done once at startup
-      • Optional frame_stride to compute every Nth reference frame (coarser but faster)
+      - Sxx/Syy/Sxy (AtA maps) cached once per reference frame -> 3 fewer boxFilters/pair
+      - Grid-point sampling fully vectorised -> no Python loop per pair
+      - Boundary check done once at startup
+      - Optional frame_stride to compute every Nth reference frame (coarser but faster)
 
     Returns:
       H (nL, nR) float32, NaN for uncomputed cells
-      best: [(l, best_r, min_val), ...] – one entry per reference frame
+      best: [(l, best_r, min_val), ...] - one entry per reference frame
     """
     if cfg is None:
         cfg = OutOfPlaneConfig()
@@ -344,7 +344,7 @@ def compute_lr_heatmap_like_matlab(
 
 
 def _compute_r2_from_best_pairs(best: List[Tuple[int, int, float]]) -> float:
-    """Compute R² of a robust linear regression through best-pair (ref, cmp) coordinates."""
+    """Compute R^2 of a robust linear regression through best-pair (ref, cmp) coordinates."""
     if len(best) < 3:
         return float("nan")
     xs = np.array([p[0] for p in best], dtype=np.float64)
@@ -374,12 +374,12 @@ def compute_scan_direction_heatmaps(
     frame_stride: int = 1,
 ) -> Tuple[str, np.ndarray, List, np.ndarray, List, float, float]:
     """
-    Compute both forward (L→R) and reverse (R→L) heatmaps and auto-detect scan direction.
+    Compute both forward (L->R) and reverse (R->L) heatmaps and auto-detect scan direction.
 
     Forward: left frames as reference, right frames as comparison (r >= l+1).
     Reverse: right frames as reference, left frames as comparison (r >= l+1).
 
-    The direction whose best-pair regression yields a higher R² is selected.
+    The direction whose best-pair regression yields a higher R^2 is selected.
 
     Returns:
         direction   : "forward" or "reverse"
@@ -387,8 +387,8 @@ def compute_scan_direction_heatmaps(
         best_fwd    : forward best pairs [(l, r, val), ...]
         H_rev       : (nR, nL) reverse heatmap
         best_rev    : reverse best pairs [(r, l, val), ...]
-        r2_fwd      : R² of forward regression
-        r2_rev      : R² of reverse regression
+        r2_fwd      : R^2 of forward regression
+        r2_rev      : R^2 of reverse regression
     """
     if cfg is None:
         cfg = OutOfPlaneConfig()

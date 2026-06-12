@@ -82,7 +82,7 @@ def solve_rigid_transform_kabsch(P_px: np.ndarray, Q_px: np.ndarray, dx_mm: floa
 
     theta = np.arctan2(R[1, 0], R[0, 0])
 
-    # Q ≈ R P + t  => t = cQ - R cP
+    # Q ~= R P + t  => t = cQ - R cP
     t_mm = cQ - (R @ cP)
 
     tx_px = t_mm[0] / dx_mm if dx_mm != 0 else 0.0

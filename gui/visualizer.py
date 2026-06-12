@@ -308,6 +308,30 @@ class VisualizerController:
             return float(ys[int(frame_idx)])
         return float(frame_idx) * self._get_y_spacing_signed_for_frame(frame_idx)
 
+    def _using_displacement_y_spacing(self) -> bool:
+        dy = getattr(self.sess, "displacement_y_spacing_mm_per_frame", None)
+        return dy is not None and np.isfinite(float(dy))
+
+    def _get_display_y_scale_to_mm(self) -> float:
+        if self._using_displacement_y_spacing():
+            ys = getattr(self.sess, "scan_y_positions", None)
+            dy_mm = float(getattr(self.sess, "displacement_y_spacing_mm_per_frame", float("nan")))
+            if ys is not None and len(ys) >= 2 and np.isfinite(dy_mm):
+                display_step = abs(float(ys[1]) - float(ys[0]))
+                if display_step > 1e-12:
+                    return dy_mm / display_step
+            return self._get_eval_xz_mm_per_px()
+        y_spacing = float(getattr(self.cfg, "y_spacing", 0.0))
+        if abs(y_spacing) < 1e-12:
+            return 1.0
+        return float(self.cfg.fh_dy_mm_per_frame) / y_spacing
+
+    def _get_current_dy_mm_per_frame(self) -> float:
+        dy = getattr(self.sess, "displacement_y_spacing_mm_per_frame", None)
+        if self._using_displacement_y_spacing() and dy is not None and np.isfinite(float(dy)):
+            return float(dy)
+        return float(self.cfg.fh_dy_mm_per_frame)
+
     def _get_display_frame_for_idx(self, frame_idx: int):
         if self._get_frame_direction(frame_idx) == "reverse":
             return self.sess.left_frames[frame_idx]
@@ -618,11 +642,24 @@ class VisualizerController:
             img_y = int(max(y_min, min(y_max, img_y)))
         # --------------------------------------------------------------
 
-        self.sess.click_point = (img_x, img_y)
         # Update depth(mm) and LR-distance from the selected center point.
         # Depth uses ROI vertical span (roi_depth_mm) and assumes y=0 is shallow.
         self.sess.update_click_metrics(img_y)
         self.sess.click_depth_mm = float(img_y) * float(self.sess.depth_mm_per_px)
+        if self.sess.click_lr_distance is None or float(self.sess.click_lr_distance) <= 0.0:
+            self.update_status(
+                f"Invalid crop center depth: LR distance is {float(self.sess.click_lr_distance):.4f}.\n"
+                "Please choose a shallower region with positive LR distance."
+            )
+            print(
+                f"[CropSelect] Rejected center ({img_x}, {img_y}): "
+                f"depth={self.sess.click_depth_mm:.4f} mm, "
+                f"LR={float(self.sess.click_lr_distance):.6f} <= 0"
+            )
+            self.plotter.render()
+            return
+
+        self.sess.click_point = (img_x, img_y)
         self.update_crop_visuals()
 
         self.update_status(
@@ -769,6 +806,14 @@ class VisualizerController:
 
         if self.sess.click_point is None:
             self.update_status("Please select crop center first!")
+            self.plotter.render()
+            return
+
+        if self.sess.click_lr_distance is None or float(self.sess.click_lr_distance) <= 0.0:
+            self.update_status(
+                "Selected crop center has non-positive LR distance.\n"
+                "Please choose a shallower valid region."
+            )
             self.plotter.render()
             return
 
@@ -1048,12 +1093,15 @@ class VisualizerController:
 
     def compute_y_heatmap_like_matlab(self):
         """
-        Compute both forward (L→R) and reverse (R→L) displacement heatmaps,
+        Compute both forward (L->R) and reverse (R->L) displacement heatmaps,
         auto-detect scan direction, and store all results in session.
         """
         if self.sess.band_left is None or self.sess.band_right is None:
             self.sess.y_heatmap = None
             self.sess.y_best_pairs = []
+            self.sess.y_positions_are_physical_mm = False
+            self.sess.displacement_y_spacing_mm_per_frame = None
+            self.sess.displacement_y_spacing_info = {}
             return
 
         of_cfg = OutOfPlaneConfig(
@@ -1162,6 +1210,43 @@ class VisualizerController:
             resid_std_global = float(np.std(residuals_to_global)) if residuals_to_global.size > 0 else float("nan")
             return r2, a, b, resid_std_global
 
+        def _fixed_offset_diagnostics(best_pairs):
+            raw_offsets = np.array(
+                [float(p[1]) - float(p[0]) for p in best_pairs],
+                dtype=np.float64,
+            )
+            raw_offsets = raw_offsets[np.isfinite(raw_offsets)]
+            raw_offsets = raw_offsets[raw_offsets > 0.0]
+            if raw_offsets.size == 0:
+                return {
+                    "frame_offset": float("nan"),
+                    "offset_mad": float("nan"),
+                    "offset_std": float("nan"),
+                    "num_offsets": 0,
+                    "num_offsets_used": 0,
+                }
+
+            med0 = float(np.median(raw_offsets))
+            mad0 = float(np.median(np.abs(raw_offsets - med0)))
+            if raw_offsets.size >= 5 and mad0 > 1e-9:
+                keep = np.abs(raw_offsets - med0) <= 2.5 * mad0
+                offsets = raw_offsets[keep]
+                if offsets.size < 3:
+                    offsets = raw_offsets
+            else:
+                offsets = raw_offsets
+
+            med = float(np.median(offsets))
+            mad = float(np.median(np.abs(offsets - med))) if offsets.size > 0 else float("nan")
+            std = float(np.std(offsets)) if offsets.size > 0 else float("nan")
+            return {
+                "frame_offset": med,
+                "offset_mad": mad,
+                "offset_std": std,
+                "num_offsets": int(raw_offsets.size),
+                "num_offsets_used": int(offsets.size),
+            }
+
         if use_scan_dir:
             for start in range(0, n_frames, seg_len):
                 end = min(start + seg_len, n_frames)
@@ -1225,14 +1310,65 @@ class VisualizerController:
                 "std": float(std_fixed),
             })
 
+        use_displacement_y = (
+            bool(getattr(self.cfg, "enable_y_spacing_from_displacement_map", False))
+            and not use_scan_dir
+        )
+        dy_from_displacement = None
+        offset_info = _fixed_offset_diagnostics(best_fwd)
+        fixed_fit_intercept = float(segments[0].get("intercept", float("nan"))) if segments else float("nan")
+        slope1_intercept = float(offset_info["frame_offset"])
+        if use_displacement_y:
+            lr_distance = float(self.sess.click_lr_distance) if self.sess.click_lr_distance is not None else float("nan")
+            min_offset = float(getattr(self.cfg, "displacement_offset_min_frames", 1.0))
+            frame_offset = slope1_intercept
+            if not np.isfinite(lr_distance) or lr_distance <= 0.0:
+                print(
+                    "[DisplacementY] Disabled: current LR distance is not positive "
+                    f"(LR={lr_distance:.6g})."
+                )
+            elif not np.isfinite(frame_offset) or frame_offset < min_offset:
+                print(
+                    "[DisplacementY] Disabled: displacement frame offset is invalid "
+                    f"(offset={frame_offset:.6g}, min={min_offset:.6g})."
+                )
+            else:
+                dy_from_displacement = lr_distance / frame_offset
+
         y_positions = np.zeros((n_frames,), dtype=np.float64)
-        for i in range(1, n_frames):
-            step = -float(self.cfg.y_spacing) if per_frame[i] == "reverse" else float(self.cfg.y_spacing)
-            y_positions[i] = y_positions[i - 1] + step
+        display_step_from_displacement = None
+        if dy_from_displacement is not None:
+            xz_mm_per_px = float(self._get_eval_xz_mm_per_px())
+            if xz_mm_per_px <= 0.0 or not np.isfinite(xz_mm_per_px):
+                xz_mm_per_px = 1.0
+            display_step_from_displacement = float(dy_from_displacement) / xz_mm_per_px
+            step = float(display_step_from_displacement)
+            for i in range(1, n_frames):
+                y_positions[i] = y_positions[i - 1] + step
+            self.sess.y_positions_are_physical_mm = False
+            self.sess.displacement_y_spacing_mm_per_frame = float(dy_from_displacement)
+            self.sess.fh_dy_mm = np.full((max(0, n_frames - 1),), float(dy_from_displacement), dtype=np.float64)
+        else:
+            for i in range(1, n_frames):
+                step = -float(self.cfg.y_spacing) if per_frame[i] == "reverse" else float(self.cfg.y_spacing)
+                y_positions[i] = y_positions[i - 1] + step
+            self.sess.y_positions_are_physical_mm = False
+            self.sess.displacement_y_spacing_mm_per_frame = None
 
         self.sess.scan_direction_segments = segments
         self.sess.scan_direction_per_frame = per_frame
         self.sess.scan_y_positions = y_positions
+        self.sess.displacement_y_spacing_info = {
+            **offset_info,
+            "enabled": bool(dy_from_displacement is not None),
+            "free_fit_intercept": float(fixed_fit_intercept),
+            "slope1_intercept_used": float(slope1_intercept),
+            "lr_distance_mm": float(self.sess.click_lr_distance) if self.sess.click_lr_distance is not None else float("nan"),
+            "dy_mm_per_frame": float(dy_from_displacement) if dy_from_displacement is not None else float("nan"),
+            "display_y_spacing": float(display_step_from_displacement) if display_step_from_displacement is not None else float("nan"),
+            "display_y_scale_to_mm": float(self._get_display_y_scale_to_mm()) if dy_from_displacement is not None else float("nan"),
+            "slope_warning_tol": float(getattr(self.cfg, "displacement_slope_warning_tol", 0.1)),
+        }
 
         # backward-compatible attributes point to the active direction
         self.sess.y_heatmap = H_fwd if direction == "forward" or H_rev is None else H_rev
@@ -1247,16 +1383,40 @@ class VisualizerController:
         for seg in segments:
             print(
                 f"[ScanDir] frames {seg['start']:04d}-{seg['end'] - 1:04d}: "
-                f"{seg['direction']}  R2={seg['r2']:.3f}  intercept={seg['intercept']:.2f}  "
+                f"{seg['direction']}  R2={seg['r2']:.3f}  slope={seg['slope']:.4f}  "
+                f"intercept={seg['intercept']:.2f}  "
                 f"std_to_global_fwd={seg['std_fwd']:.3f}  std_to_global_rev={seg['std_rev']:.3f}  "
                 f"R2_fwd={seg['r2_fwd']:.3f}  R2_rev={seg['r2_rev']:.3f}"
             )
+        info = self.sess.displacement_y_spacing_info
+        print(
+            "[DisplacementY] "
+            f"enabled={bool(info.get('enabled', False))}  "
+            f"LR={float(info.get('lr_distance_mm', float('nan'))):.6f} mm  "
+            f"slope1_intercept_used={float(info.get('slope1_intercept_used', float('nan'))):.4f} frames  "
+            f"free_fit_intercept_diag={float(info.get('free_fit_intercept', float('nan'))):.4f} frames  "
+            f"offset_MAD={float(info.get('offset_mad', float('nan'))):.4f}  "
+            f"offset_STD={float(info.get('offset_std', float('nan'))):.4f}  "
+            f"offsets_used={int(info.get('num_offsets_used', 0))}/{int(info.get('num_offsets', 0))}  "
+            f"dy={float(info.get('dy_mm_per_frame', float('nan'))):.6f} mm/frame  "
+            f"display_y_spacing={float(info.get('display_y_spacing', float('nan'))):.4f}  "
+            f"display_y_scale_to_mm={float(info.get('display_y_scale_to_mm', float('nan'))):.6f}"
+        )
+        if segments and not use_scan_dir:
+            slope = float(segments[0].get("slope", float("nan")))
+            tol = float(getattr(self.cfg, "displacement_slope_warning_tol", 0.1))
+            if np.isfinite(slope) and abs(slope - 1.0) > tol:
+                print(
+                    "[DisplacementY][Warning] Best-pair fit slope is not close to 1: "
+                    f"slope={slope:.6f}, tol={tol:.6f}. "
+                    "The slope=1 intercept is used for dy."
+                )
 
     
     def show_out_of_plane_heatmap_overlay(self):
         """
-        2-panel heatmap overlay: Forward (L→R) | Reverse (R→L).
-        Selected direction shown in colour; ±1 local-std band drawn around regression line.
+        2-panel heatmap overlay: Forward (L->R) | Reverse (R->L).
+        Selected direction shown in colour; +/-1 local-std band drawn around regression line.
         Click overlay to hide.
         """
         if self.heatmap_overlay_label is None:
@@ -1331,7 +1491,7 @@ class VisualizerController:
             if valid_ref_end > 0:
                 ax.axvline(valid_ref_end - 1, color="#444444", linewidth=0.8, alpha=0.35, zorder=7)
 
-        # ── inner helper ──────────────────────────────────────────────────
+        # Inner helper
         def _draw_panel(ax, H, best_pairs, xlabel, ylabel):
             if H is None or H.size == 0:
                 ax.text(0.5, 0.5, "N/A", transform=ax.transAxes,
@@ -1368,7 +1528,7 @@ class VisualizerController:
                 a, b = np.polyfit(xs_in, ys_in, 1)
                 residuals = ys_in - (a * xs_in + b)
 
-                # ── ±1 local-std band ──────────────────────────────────
+                # +/-1 local-std band
                 x_eval = np.linspace(float(xs_in.min()), float(xs_in.max()), 300)
                 win_h  = max((float(xs_in.max()) - float(xs_in.min())) * 0.08, 3.0)
                 global_std = float(np.std(residuals)) if len(residuals) > 1 else 0.0
@@ -1382,8 +1542,8 @@ class VisualizerController:
                                 y_eval - local_std,
                                 y_eval + local_std,
                                 alpha=0.30, color="cyan", zorder=4,
-                                label="±1 local std")
-                # ──────────────────────────────────────────────────────
+                                label="+/-1 local std")
+
 
                 # scatter
                 if len(xs_out):
@@ -1397,7 +1557,7 @@ class VisualizerController:
                         color="yellow", linewidth=2.0, zorder=6,
                         label="Linear regression")
 
-                # R² / slope annotation
+                # R^2 / slope annotation
                 ax.legend(fontsize=10, loc="upper left",
                           framealpha=0.75, edgecolor="none")
 
@@ -1411,7 +1571,7 @@ class VisualizerController:
             ax.tick_params(labelsize=11)
             ax.grid(True, alpha=0.25)
             return im
-        # ──────────────────────────────────────────────────────────────────
+
 
         im_fwd = _draw_panel(ax_fwd, H_fwd, best_fwd,
                              "Left frame #  (reference)",
@@ -1422,7 +1582,7 @@ class VisualizerController:
                                  "Right frame #  (reference)",
                                  "Left frame #  (comparison)")
 
-        # ── panel titles (no spine borders) ───────────────────────────────
+        # Panel titles (no spine borders)
         if use_scan_dir:
             _panel_segments(ax_fwd, "forward")
             _panel_segments(ax_rev, "reverse")
@@ -1438,7 +1598,7 @@ class VisualizerController:
         if im_rev is not None:
             fig.colorbar(im_rev, ax=ax_rev, fraction=0.046, pad=0.04)
 
-        # ── overall title + stacking info ────────────────────────────────
+        # Overall title + stacking info
         title = (f"Y Displacement Heatmap - segmented direction every {seg_len} frames"
                  if use_scan_dir else "Y Displacement Heatmap - fixed L -> R")
         fig.suptitle(title, fontsize=17, fontweight="bold")
@@ -1567,7 +1727,7 @@ class VisualizerController:
         ax1.plot(x, beta, linewidth=1.4)
         ax1.set_ylabel("beta (deg)")
         ax1.set_title(
-            f"Out-of-plane Rotation ({plane_label}, 3×3 grid, excl. center, lookahead=10)"
+            f"Out-of-plane Rotation ({plane_label}, 3x3 grid, excl. center, lookahead=10)"
         )
         ax1.grid(True, alpha=0.25)
 
@@ -1762,10 +1922,9 @@ class VisualizerController:
                 # Fallback if calibration failed
                 depth_mm_per_px = 0.1 
 
-        # Y scale calculation (display Y units -> actual mm)
-        # Display Y = frame_idx * y_spacing
-        # Target Y = frame_idx * fh_dy_mm_per_frame
-        y_scale = float(self.cfg.fh_dy_mm_per_frame) / float(self.cfg.y_spacing)
+        # Y scale calculation (display Y units -> actual mm).
+        # Displacement-map spacing uses pixel-equivalent display Y, then scales back to mm.
+        y_scale = self._get_display_y_scale_to_mm()
 
         mesh_mm = mesh_px.copy(deep=True)
         pts = np.asarray(mesh_mm.points, dtype=np.float64).copy()
@@ -2541,10 +2700,9 @@ class VisualizerController:
         ys = getattr(self.sess, "scan_y_positions", None)
         if ys is not None and len(ys) >= n_frames:
             y_display = np.asarray(ys[:n_frames], dtype=np.float64)
-            y_scale_to_mm = float(self.cfg.fh_dy_mm_per_frame) / float(self.cfg.y_spacing)
-            ty = y_display * y_scale_to_mm
+            ty = y_display * self._get_display_y_scale_to_mm()
         else:
-            ty = np.arange(n_frames, dtype=np.float64) * float(self.cfg.fh_dy_mm_per_frame)
+            ty = np.arange(n_frames, dtype=np.float64) * self._get_current_dy_mm_per_frame()
 
         beta = np.asarray(self.sess.beta_deg if self.sess.beta_deg is not None else [], dtype=np.float64).reshape(-1)
         gamma = np.asarray(self.sess.gamma_deg if self.sess.gamma_deg is not None else [], dtype=np.float64).reshape(-1)
@@ -2673,21 +2831,31 @@ class VisualizerController:
             mesh_xyz_scale = 1.0
             mesh_for_export = self.sess.surface_mesh_px
             coordinate_units = "display"
-            dy_export = float(self.cfg.y_spacing)
+            dy_export = (
+                self._get_current_dy_mm_per_frame()
+                if self._using_displacement_y_spacing()
+                else float(self.cfg.y_spacing)
+            )
         elif export_space == "display_scaled_mm":
             xz_scale = self._get_eval_xz_mm_per_px()
-            y_scale = self._get_eval_xz_mm_per_px()
-            mesh_xyz_scale = self._get_eval_xz_mm_per_px()
-            mesh_for_export = self.sess.surface_mesh_px
+            if self._using_displacement_y_spacing():
+                y_scale = self._get_display_y_scale_to_mm()
+                mesh_xyz_scale = 1.0
+                mesh_for_export = self.sess.surface_mesh_mm
+            else:
+                y_scale = self._get_eval_xz_mm_per_px()
+                mesh_xyz_scale = self._get_eval_xz_mm_per_px()
+                mesh_for_export = self.sess.surface_mesh_px
             coordinate_units = "mm"
-            dy_export = float(self.cfg.y_spacing) * float(mesh_xyz_scale)
+            dy_export = float(self._get_current_dy_mm_per_frame()) if self._using_displacement_y_spacing() \
+                else float(self.cfg.y_spacing) * float(mesh_xyz_scale)
         else:
             xz_scale = self._get_eval_xz_mm_per_px()
-            y_scale = float(self.cfg.fh_dy_mm_per_frame) / float(self.cfg.y_spacing)
+            y_scale = self._get_display_y_scale_to_mm()
             mesh_xyz_scale = 1.0
             mesh_for_export = self.sess.surface_mesh_mm
             coordinate_units = "mm"
-            dy_export = float(self.cfg.fh_dy_mm_per_frame)
+            dy_export = float(self._get_current_dy_mm_per_frame())
 
         y_origin_frame_idx0 = self._get_eval_y_origin_frame_idx0(sampled_idx0, n_frames)
         y_origin_display = self._get_y_position_for_frame(int(round(y_origin_frame_idx0)))
@@ -2706,7 +2874,7 @@ class VisualizerController:
 
             pts_xz_mm = []
             for (u, v) in pts_uv_px:
-                # simulation mode 下 x/z = 0.1 mm/px
+                # In simulation mode, x/z = 0.1 mm/px.
                 x_mm = float(u) * xz_scale
                 z_mm = float(self.sess.frame_h - v) * xz_scale
                 pts_xz_mm.append([x_mm, z_mm])
@@ -2746,6 +2914,8 @@ class VisualizerController:
                 "mesh_xyz_scale": float(mesh_xyz_scale),
                 "y_spacing_display": float(self.cfg.y_spacing),
                 "y_scale_to_mm": float(y_scale),
+                "uses_displacement_y_spacing": bool(self._using_displacement_y_spacing()),
+                "displacement_y_spacing_mm_per_frame": float(self._get_current_dy_mm_per_frame()),
                 "y_origin_mode": str(getattr(self.cfg, "eval_y_origin_mode", "labeled_mid")),
                 "y_origin_frame_idx0": float(y_origin_frame_idx0),
                 "y_origin_mm": float(y_origin_mm),
